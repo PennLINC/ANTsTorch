@@ -40,7 +40,9 @@ include = ["antstorch*"]
 [tool.setuptools.package-data]
 # Bundles the 90-pair Mindboggle-101 definition antstorch.benchmark ships
 # with, so it is present in installed (not just editable/checkout) installs.
-antstorch = ["benchmark/pairs.csv"]
+# syn/data holds the aPSF direction sets (60 and 300 directions, MRtrix3 dirgen)
+# used for FOD reorientation.
+antstorch = ["benchmark/pairs.csv", "syn/data/*.txt"]
 
 [project.urls]
 "Homepage" = "https://github.com/ANTsX/ANTsTorch"

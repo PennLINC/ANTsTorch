@@ -204,7 +204,8 @@ def local_ncc_loss_nd(
     mask: torch.Tensor = None,
     window_size: int = 9,
     use_ants_pseudo_gradient: bool = False,
-    squared: bool = False
+    squared: bool = False,
+    joint_channels: bool = False,
 ) -> torch.Tensor:
     r"""Local Normalized Cross-Correlation (LNCC) loss between N-D images.
 
@@ -218,7 +219,13 @@ def local_ncc_loss_nd(
     Parameters
     ----------
     I, J : torch.Tensor
-        Image tensors of shape ``(B, 1, *spatial)``.
+        Image tensors of shape ``(B, C, *spatial)``. With ``C > 1`` and
+        ``joint_channels=False`` the correlation is computed per channel and
+        averaged over channels and voxels; with ``joint_channels=True`` the
+        window moments (variances and covariance) are summed over the
+        channels first, which treats each voxel's channels as one vector
+        and weights channels by their local variance (the natural extension
+        of CC to vector-valued images such as spherical harmonic series).
     mask : torch.Tensor, optional
         Binary mask of shape ``(B, 1, *spatial)`` identifying active
         evaluation voxels.
@@ -253,6 +260,8 @@ def local_ncc_loss_nd(
         if window_size % 2 == 0:
             window_size = max(1, window_size - 1)
 
+    if use_ants_pseudo_gradient and joint_channels:
+        raise ValueError("joint_channels=True is only available with the autograd (pooling) LNCC path")
     if use_ants_pseudo_gradient and squared:
         return ANTsPseudoLNCC.apply(I, J, mask, window_size)
     elif use_ants_pseudo_gradient and not squared:
@@ -276,6 +285,10 @@ def local_ncc_loss_nd(
     I_var = torch.clamp(box_filter((I - I_mean) ** 2), min=0.0)
     J_var = torch.clamp(box_filter((J - J_mean) ** 2), min=0.0)
     IJ_cov = box_filter((I - I_mean) * (J - J_mean))
+    if joint_channels and I.shape[1] > 1:
+        I_var = I_var.sum(dim=1, keepdim=True)
+        J_var = J_var.sum(dim=1, keepdim=True)
+        IJ_cov = IJ_cov.sum(dim=1, keepdim=True)
 
     var_floor = 1e-6
     safe_I_var = torch.clamp(I_var, min=var_floor)

@@ -79,43 +79,54 @@ def ants_image_to_tensor(
     *,
     normalize: bool = True,
 ) -> Tensor:
-    """Convert a scalar ``ants.ANTsImage`` to a singleton ``(1, 1, *torch_shape)`` tensor.
+    """Convert an ``ants.ANTsImage`` to a channel-first ``(1, C, *torch_shape)`` tensor.
 
     Parameters
     ----------
     image : ants.ANTsImage
-        Scalar 2-D or 3-D image.
+        2-D or 3-D image, scalar (``C = 1``) or multi-component (``C`` =
+        ``image.components``, e.g. the coefficients of a spherical harmonic
+        series).
     device, dtype : torch.device, torch.dtype
         Target tensor device/dtype.
     normalize : bool
         If ``True`` (default), apply the same foreground percentile-clip
-        normalization as :func:`antstorch.syn.core.pipeline.normalize_and_tensorize`.
+        normalization as :func:`antstorch.syn.core.pipeline.normalize_and_tensorize`
+        (per channel for a multi-component image).
 
     Returns
     -------
     Tensor
-        Shape ``(1, 1, *torch_shape)``, spatial axes in reversed
+        Shape ``(1, C, *torch_shape)``, spatial axes in reversed
         (``(z, y, x)``-style) PyTorch order.
     """
-    if image.dimension not in (2, 3) or image.components != 1:
-        raise ValueError("ants_image_to_tensor expects a scalar 2-D or 3-D ANTsImage")
+    if image.dimension not in (2, 3):
+        raise ValueError("ants_image_to_tensor expects a 2-D or 3-D ANTsImage")
     array = image.numpy().astype(np.float32, copy=False)
-    if normalize:
-        array = _percentile_clip_normalize(array)
     dimension = image.dimension
     reversed_axes = tuple(range(dimension - 1, -1, -1))
-    array = np.ascontiguousarray(np.transpose(array, reversed_axes))
-    tensor = torch.from_numpy(array).unsqueeze(0).unsqueeze(0)
+    if image.components > 1:
+        # (x, y[, z], C) -> (C, [z,] y, x)
+        if normalize:
+            array = np.stack([_percentile_clip_normalize(array[..., c]) for c in range(array.shape[-1])], axis=-1)
+        array = np.ascontiguousarray(np.transpose(array, (dimension,) + reversed_axes))
+        tensor = torch.from_numpy(array).unsqueeze(0)
+    else:
+        if normalize:
+            array = _percentile_clip_normalize(array)
+        array = np.ascontiguousarray(np.transpose(array, reversed_axes))
+        tensor = torch.from_numpy(array).unsqueeze(0).unsqueeze(0)
     return tensor.to(device=device, dtype=dtype)
 
 
 def tensor_to_ants_image(tensor: Tensor, reference):
-    """Convert a singleton ``(1, 1, *torch_shape)`` tensor to a scalar ``ants.ANTsImage``.
+    """Convert a channel-first ``(1, C, *torch_shape)`` tensor to an ``ants.ANTsImage``.
 
     Parameters
     ----------
     tensor : Tensor
-        Shape ``(1, 1, *torch_shape)``.
+        Shape ``(1, C, *torch_shape)``; ``C = 1`` gives a scalar image, ``C > 1``
+        a multi-component (vector) image.
     reference : ants.ANTsImage
         Supplies spacing/origin/direction for the output image.
 
@@ -125,10 +136,20 @@ def tensor_to_ants_image(tensor: Tensor, reference):
     """
     import ants
 
-    if tensor.ndim != reference.dimension + 2 or tensor.shape[0] != 1 or tensor.shape[1] != 1:
-        raise ValueError("tensor must have shape (1, 1, *torch_shape)")
+    if tensor.ndim != reference.dimension + 2 or tensor.shape[0] != 1:
+        raise ValueError("tensor must have shape (1, C, *torch_shape)")
     dimension = reference.dimension
     reversed_axes = tuple(range(dimension - 1, -1, -1))
+    if tensor.shape[1] > 1:
+        # (C, [z,] y, x) -> (x, y[, z], C)
+        array = np.ascontiguousarray(np.transpose(tensor.detach().cpu().numpy()[0], tuple(range(dimension, 0, -1)) + (0,)))
+        return ants.from_numpy(
+            array,
+            origin=reference.origin,
+            spacing=reference.spacing,
+            direction=reference.direction,
+            has_components=True,
+        )
     array = np.ascontiguousarray(np.transpose(tensor.detach().cpu().numpy()[0, 0], reversed_axes))
     return ants.from_numpy(
         array,

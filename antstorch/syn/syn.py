@@ -75,6 +75,7 @@ from .core.grid import (
 from .core.inverse import update_inverse_field_nd
 from .core.jacobian import compute_jacobian_determinant_nd
 from .core.losses import local_ncc_loss_nd, mattes_mi_loss_nd, box_cc2_loss_nd, soft_dice_loss_nd
+from .fod import FODRegistration, default_fod_lmax, sh_lmax_of_image
 from .core.pipeline import auto_detect_device, mps_grid_sample_3d_available, mps_grid_sample_3d_forward_available
 from .core.smoothing import (
     apply_dsti_green_operator,
@@ -85,7 +86,10 @@ from .core.smoothing import (
 
 _LINEAR_TRANSFORM_TYPES = ("Translation", "Rigid", "Similarity", "Affine")
 _SYN_TRANSFORM_TYPES = ("SyN", "SyNOnly")
-_SIMILARITY_METRICS = ("mse", "lncc", "cc", "lncc2", "cc2", "mattes", "mi", "box_cc2", "dice")
+_SIMILARITY_METRICS = (
+    "mse", "lncc", "cc", "lncc2", "cc2", "lncc_joint", "cc_joint", "lncc2_joint", "cc2_joint",
+    "mattes", "mi", "box_cc2", "dice",
+)
 _REGULARIZERS = ("gaussian", "sobolev", "dsti", "bspline")
 # 'gradient_descent' (default): the existing CFL-bounded plain-gradient
 # Eulerian update. 'reg_adam': ported from syntx's greedy.py
@@ -261,6 +265,10 @@ def _similarity_loss(name: str, I: Tensor, J: Tensor, mask: Optional[Tensor], wi
         return local_ncc_loss_nd(I, J, mask=mask, window_size=window_size, squared=False)
     if name in ("lncc2", "cc2"):
         return local_ncc_loss_nd(I, J, mask=mask, window_size=window_size, squared=True)
+    if name in ("lncc_joint", "cc_joint"):
+        return local_ncc_loss_nd(I, J, mask=mask, window_size=window_size, squared=False, joint_channels=True)
+    if name in ("lncc2_joint", "cc2_joint"):
+        return local_ncc_loss_nd(I, J, mask=mask, window_size=window_size, squared=True, joint_channels=True)
     if name == "box_cc2":
         return box_cc2_loss_nd(I, J, window_size=window_size)
     if name == "dice":
@@ -445,7 +453,12 @@ def _fit_syn_level(
     use_analytical_gradients: bool = True,
     sobolev_alpha: Optional[float] = None,
     optimizer_lr: float = 1.0,
+    fod_reorient=None,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor, list]:
+    # fod_reorient: optional callable (I_mid, J_mid, warp_l2r, warp_r2l) -> (I_mid, J_mid)
+    # applied to the images sampled at the midpoint before the similarity is
+    # evaluated (FOD reorientation by the half-warp Jacobians, see
+    # antstorch.syn.fod.FODRegistration.midpoint_hook).
     device, dtype = I_curr.device, I_curr.dtype
     fixed_meta_t = metadata_tensors_from_dict(fixed_meta, device, dtype)
     moving_meta_t = metadata_tensors_from_dict(moving_meta, device, dtype)
@@ -524,7 +537,10 @@ def _fit_syn_level(
             t_phys,
             None,
             use_analytical_gradients=use_analytical_gradients,
+            compute_gradients=False,
         )
+        if fod_reorient is not None:
+            I_mid, J_mid = fod_reorient(I_mid, J_mid, warp_l2r_leaf, warp_r2l_leaf)
         loss = _similarity_loss(similarity, I_mid, J_mid, in_bounds_mask, window_size, num_bins)
         if not torch.isfinite(loss):
             raise FloatingPointError(f"non-finite SyN loss at resolution level {level_index + 1}")
@@ -705,8 +721,10 @@ def _fit_syn_level(
                 fixed_meta_t["shape_t"], fixed_meta_t["spacing_t"], fixed_meta_t["origin_t"], fixed_meta_t["direction_t"],
                 moving_meta_t["shape_t"], moving_meta_t["spacing_t"], moving_meta_t["origin_t"], moving_meta_t["direction_t"],
                 fixed_meta["spacing"], moving_meta["spacing"], M_phys, t_phys, None,
-                use_analytical_gradients=False,
+                use_analytical_gradients=False, compute_gradients=False,
             )
+            if fod_reorient is not None:
+                I_f, J_f = fod_reorient(I_f, J_f, warp_l2r, warp_r2l)
             final_loss = float(_similarity_loss(similarity, I_f, J_f, m_f, window_size, num_bins).item())
         if final_loss >= best_loss:
             warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv = best_state
@@ -896,6 +914,10 @@ def syn_registration(
     outprefix: str = "",
     device: Optional[Union[str, torch.device]] = None,
     dtype: torch.dtype = torch.float32,
+    fod: bool = False,
+    fod_lmax: Optional[Sequence[int]] = None,
+    fod_directions=60,
+    fod_modulate: bool = False,
     verbose: bool = False,
 ) -> Dict[str, object]:
     """Register ``moving`` onto ``fixed`` with (optionally affine-initialized) greedy symmetric SyN.
@@ -1108,6 +1130,27 @@ def syn_registration(
     :func:`antstorch.bspline_flows.bspline_svf_registration.bspline_svf_registration`'s
     ``shrink_factors``, this pyramid need not be a strict dyadic halving.
 
+    **Multi-component images and FODs.** ``fixed``/``moving`` may be
+    multi-component images: every channel is warped by the same deformation
+    and the similarity is evaluated over all channels (per channel for
+    ``'lncc'``; ``'lncc_joint'``/``'lncc2_joint'`` sum the window moments over
+    the channels first, treating each voxel as one vector). With ``fod=True``
+    the channels are taken to be an even-degree spherical harmonic series in
+    the MRtrix3 convention (see :mod:`antstorch.syn.sh`; read such images with
+    :func:`antstorch.syn.fod.fod_image_read`): both images are scaled by one
+    common factor (the 99th percentile of ``fixed``'s ``l = 0`` coefficient)
+    instead of the per-image percentile normalization, the affine stage runs
+    on the ``l = 0`` coefficient, each pyramid level registers the series
+    truncated to ``fod_lmax[level]`` (default: ``0, 2, 4, ...`` capped at 4,
+    like ``mrregister``), the images sampled at the SyN midpoint are
+    reoriented by the Jacobians of the half-warps with apodized point spread
+    functions on ``fod_directions`` directions (``60``, ``300`` or a direction
+    file), and ``warpedmovout``/``warpedfixout`` are reoriented by the total
+    forward/inverse maps (``fod_modulate=True`` also applies FOD modulation,
+    MRtrix3's ``-modulate fod``). The default ``syn_metric`` for FODs is
+    ``'lncc_joint'``; ``'mse'`` on the coefficients is the ``mrregister``
+    choice.
+
     Returns
     -------
     dict
@@ -1130,6 +1173,7 @@ def syn_registration(
         _SYNTX_DEFAULTS.get((regularizer, optimizer), _LEGACY_DEFAULTS) if syntx_defaults else _LEGACY_DEFAULTS
     )
     _levels_given, _iterations_given = levels is not None, reg_iterations is not None
+    _fod_default_metric = syn_metric is None  # FOD inputs get their own default metric (see below)
     if syn_metric is None:
         syn_metric = _defaults["syn_metric"]
     if levels is None:
@@ -1307,6 +1351,30 @@ def syn_registration(
             resolved_device = torch.device("cpu")
     resolved_outprefix = outprefix if outprefix else default_outprefix()
 
+    # --- FOD (spherical harmonic) inputs ----------------------------------
+    fod_registration = None
+    affine_fixed, affine_moving = fixed, moving
+    if fod:
+        if dimension != 3:
+            raise ValueError("fod=True requires 3-D spherical harmonic images")
+        if fixed.components != moving.components:
+            raise ValueError("fixed and moving must have the same number of spherical harmonic coefficients")
+        image_lmax = sh_lmax_of_image(fixed)
+        if fod_lmax is None:
+            fod_lmax = default_fod_lmax(len(levels), image_lmax)
+        fod_lmax = tuple(int(value) for value in fod_lmax)
+        if len(fod_lmax) != len(levels):
+            raise ValueError(f"fod_lmax must have one entry per level ({len(levels)}), got {len(fod_lmax)}")
+        fod_registration = FODRegistration(
+            image_lmax, fod_lmax, directions=fod_directions, modulate_output=fod_modulate,
+            device=resolved_device, dtype=dtype,
+        )
+        if _fod_default_metric:
+            syn_metric = "lncc_joint"
+        # The affine stage is scalar: fit it on the l = 0 coefficient.
+        affine_fixed = fod_registration.scalar_channel(fixed)
+        affine_moving = fod_registration.scalar_channel(moving)
+
     # --- Affine stage -----------------------------------------------------
     affine_result = None
     if initial_affine is not None:
@@ -1318,7 +1386,7 @@ def syn_registration(
     elif type_of_transform in _LINEAR_TRANSFORM_TYPES or type_of_transform == "SyN":
         affine_type = type_of_transform if type_of_transform in _LINEAR_TRANSFORM_TYPES else affine_transform_type
         matrix_xyz, translation_xyz, affine_result = _fit_affine_from_ants(
-            fixed, moving, resolved_device, dtype,
+            affine_fixed, affine_moving, resolved_device, dtype,
             transform_type=affine_type,
             similarity=affine_similarity,
             neighborhood_radius=affine_neighborhood_radius,
@@ -1358,6 +1426,8 @@ def syn_registration(
         warpedmovout_tensor = warp_image(
             moving_tensor, fwd_field_xyz, fixed_domain, moving_domain, padding_mode=padding_mode
         )
+        if fod_registration is not None:
+            warpedmovout_tensor = fod_registration.reorient_affine(warpedmovout_tensor, matrix_xyz)
 
         matrix_out = matrix_xyz.detach().cpu()
         translation_out = translation_xyz.detach().cpu()
@@ -1394,8 +1464,17 @@ def syn_registration(
 
     fixed_meta_full = ants_image_metadata(fixed)
     moving_meta_full = ants_image_metadata(moving)
-    I_full = ants_image_to_tensor(fixed, resolved_device, dtype)
-    J_full = ants_image_to_tensor(moving, resolved_device, dtype)
+    if fod_registration is not None:
+        # One common scale for every coefficient of both images keeps the
+        # series' relative amplitudes (and hence the FOD shapes) intact.
+        I_full = ants_image_to_tensor(fixed, resolved_device, dtype, normalize=False)
+        J_full = ants_image_to_tensor(moving, resolved_device, dtype, normalize=False)
+        fod_scale = fod_registration.intensity_scale(I_full)
+        I_full = I_full * fod_scale
+        J_full = J_full * fod_scale
+    else:
+        I_full = ants_image_to_tensor(fixed, resolved_device, dtype)
+        J_full = ants_image_to_tensor(moving, resolved_device, dtype)
 
     # Resolve any spline-distance parameter into the base-level mesh size it
     # replaces, once, against fixed's FULL native-resolution domain -- matching
@@ -1454,8 +1533,15 @@ def syn_registration(
     warp_l2r = warp_r2l = warp_l2r_inv = warp_r2l_inv = None
     level_loss_history = []
     for level_index, (factor, iteration_count) in enumerate(zip(levels, reg_iterations)):
-        I_level, fixed_meta_level = _downsample_image(I_full, fixed_meta_full, factor, syntx_parity)
-        J_level, moving_meta_level = _downsample_image(J_full, moving_meta_full, factor, syntx_parity)
+        I_source, J_source = I_full, J_full
+        if fod_registration is not None:
+            I_source = fod_registration.channels(I_full, fod_lmax[level_index])
+            J_source = fod_registration.channels(J_full, fod_lmax[level_index])
+        I_level, fixed_meta_level = _downsample_image(I_source, fixed_meta_full, factor, syntx_parity)
+        J_level, moving_meta_level = _downsample_image(J_source, moving_meta_full, factor, syntx_parity)
+        fod_reorient = None
+        if fod_registration is not None:
+            fod_reorient = fod_registration.midpoint_hook(fod_lmax[level_index], fixed_meta_level, M_phys)
         if warp_l2r is None:
             zeros = torch.zeros(
                 (1,) + fixed_meta_level["torch_shape"] + (dimension,), device=resolved_device, dtype=dtype
@@ -1494,6 +1580,8 @@ def syn_registration(
                     total_mesh_size_level = _scale_mesh_size(resolved_total_field_mesh_size_at_base_level, level_scale)
                     total_field_control_points = _mesh_size_control_points(total_mesh_size_level, dim)
                     message += f"total_field_control_points={total_field_control_points}, "
+            if fod_registration is not None:
+                message += f"lmax={fod_lmax[level_index]}, "
             message += f"iterations={iteration_count}"
             print(message)
 
@@ -1531,6 +1619,7 @@ def syn_registration(
             optimizer_lr=optimizer_lr,
             regadam_grad_sigma=regadam_grad_sigma,
             regadam_quotient_sigma=regadam_quotient_sigma,
+            fod_reorient=fod_reorient,
         )
         level_loss_history.append(history)
 
@@ -1576,6 +1665,10 @@ def syn_registration(
         ),
         mode="bilinear", padding_mode=padding_mode, align_corners=True,
     )
+    if fod_registration is not None:
+        # Reorient the warped FODs by the Jacobians of the total pull-back maps.
+        warpedmovout = fod_registration.reorient_warped(warpedmovout, total_forward, fixed_meta_full)
+        warpedfixout = fod_registration.reorient_warped(warpedfixout, total_inverse, fixed_meta_full)
 
     # total_forward is already a genuine physical-mm displacement field
     # (not a normalized-grid one), so the lower-level, spacing-aware
@@ -1645,6 +1738,10 @@ def syn_registration(
             "syntx_defaults": syntx_defaults,
             "optimizer_lr": optimizer_lr,
             "use_analytical_gradients": use_analytical_gradients,
+            "fod": fod,
+            "fod_lmax": tuple(fod_lmax) if fod else None,
+            "fod_directions": fod_directions if fod else None,
+            "fod_modulate": fod_modulate if fod else None,
             "affine_fit": affine_result is not None,
             "device": str(resolved_device),
             "outprefix": resolved_outprefix,

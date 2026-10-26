@@ -402,7 +402,8 @@ def prepare_mid_images_and_gradients_torch(
     M_phys, t_phys, initial_grid_level,
     interpolator='linear',
     grad_I_curr=None, grad_J_curr=None,
-    use_analytical_gradients=True
+    use_analytical_gradients=True,
+    compute_gradients=True,
 ):
     """Sample both images (and their gradients) at the symmetric SyN midpoint.
 
@@ -411,6 +412,12 @@ def prepare_mid_images_and_gradients_torch(
     this resamples the fixed and moving images (and, if not already
     supplied, their spatial gradients) at the midpoint locations, and
     returns an in-bounds mask marking where both samples are valid.
+
+    ``I_curr``/``J_curr`` may have any number of channels ``C``; the sampled
+    gradients then have shape ``(B, *spatial, C, dim)`` (``(B, *spatial, dim)``
+    for a single channel, as before). With ``compute_gradients=False`` the
+    gradient terms are skipped and returned as ``None``; the SyN loop, which
+    differentiates the similarity by autograd, does not need them.
 
     Returns
     -------
@@ -439,19 +446,32 @@ def prepare_mid_images_and_gradients_torch(
 
     J_mid = grid_sample_nd(J_curr, y_norm, padding_mode='border', align_corners=True, interpolator=interpolator, use_analytical_gradients=use_analytical_gradients)
 
-    if grad_I_curr is None:
-        grad_I_curr = _spatial_jacobian_nd(I_curr.movedim(1, -1), physical_spacing=tuple(reversed(fixed_spacing))).squeeze(-2)
-    if grad_J_curr is None:
-        grad_J_curr = _spatial_jacobian_nd(J_curr.movedim(1, -1), physical_spacing=tuple(reversed(moving_spacing))).squeeze(-2)
-
-    grad_I_mid_sampled = grid_sample_nd(grad_I_curr.movedim(-1, 1), coords_norm, padding_mode='border', align_corners=True, interpolator=interpolator, use_analytical_gradients=use_analytical_gradients).movedim(1, -1).contiguous()
-    grad_I_mid_sampled = torch.matmul(grad_I_mid_sampled, fixed_direction_t.t())
-
-    grad_J_mid_sampled = grid_sample_nd(grad_J_curr.movedim(-1, 1), y_norm, padding_mode='border', align_corners=True, interpolator=interpolator, use_analytical_gradients=use_analytical_gradients).movedim(1, -1).contiguous()
-    grad_J_mid_sampled = torch.matmul(grad_J_mid_sampled, moving_direction_t.t())
-    grad_J_mid_sampled = torch.matmul(grad_J_mid_sampled, M_phys)
-
     dim = coords_norm.shape[-1]
+
+    grad_I_mid_sampled = grad_J_mid_sampled = None
+    if compute_gradients:
+        channels = I_curr.shape[1]
+        if grad_I_curr is None:
+            # (B, *spatial, C, dim): one spatial gradient per channel; squeezed to (B, *spatial, dim) for C == 1.
+            grad_I_curr = _spatial_jacobian_nd(I_curr.movedim(1, -1), physical_spacing=tuple(reversed(fixed_spacing))).squeeze(-2)
+        if grad_J_curr is None:
+            grad_J_curr = _spatial_jacobian_nd(J_curr.movedim(1, -1), physical_spacing=tuple(reversed(moving_spacing))).squeeze(-2)
+
+        def _sample_gradient(grad, grid):
+            # Flatten the trailing (C, dim) (or (dim,)) axes into channels for sampling, then restore them.
+            trailing = grad.shape[1 + dim:]
+            flat = grad.reshape(grad.shape[: 1 + dim] + (-1,)).movedim(-1, 1)
+            sampled = grid_sample_nd(flat, grid, padding_mode='border', align_corners=True, interpolator=interpolator, use_analytical_gradients=use_analytical_gradients)
+            return sampled.movedim(1, -1).reshape(sampled.shape[:1] + grid.shape[1:-1] + trailing).contiguous()
+
+        grad_I_mid_sampled = _sample_gradient(grad_I_curr, coords_norm)
+        grad_I_mid_sampled = torch.matmul(grad_I_mid_sampled, fixed_direction_t.t())
+
+        grad_J_mid_sampled = _sample_gradient(grad_J_curr, y_norm)
+        grad_J_mid_sampled = torch.matmul(grad_J_mid_sampled, moving_direction_t.t())
+        grad_J_mid_sampled = torch.matmul(grad_J_mid_sampled, M_phys)
+        del channels
+
     mask_I = (coords_norm[..., 0] >= -1.0) & (coords_norm[..., 0] <= 1.0)
     for d in range(1, dim):
         mask_I = mask_I & (coords_norm[..., d] >= -1.0) & (coords_norm[..., d] <= 1.0)

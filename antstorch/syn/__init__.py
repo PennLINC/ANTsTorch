@@ -45,11 +45,21 @@ from .robust_affine import (
     compute_center_of_mass,
     compute_fov_center,
 )
+from . import sh
+from . import fod
+from .sh import FODReorienter
+from .fod import FODRegistration, fod_image_read, fod_image_write
 
 __all__ = [
     'core',
+    'sh',
+    'fod',
     'syn_registration',
     'build_template',
+    'FODReorienter',
+    'FODRegistration',
+    'fod_image_read',
+    'fod_image_write',
     'robust_affine',
     'robust_center_of_mass',
     'compute_center_of_mass',
