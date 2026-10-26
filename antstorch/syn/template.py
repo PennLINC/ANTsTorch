@@ -13,6 +13,14 @@ warped images, then moves that average back by ``gradient_step`` times the mean
 toward the centre of shape of the group.  Per iteration the size and roughness
 of the mean warp (RMS displacement, membrane and bending energy) and the mean
 absolute template change are recorded.
+
+Multi-component images are supported, and with ``fod=True`` (forwarded to
+:func:`antstorch.syn.syn_registration`) the channels are treated as a spherical
+harmonic series in the MRtrix3 convention: the per-image registrations
+reorient the FODs, the shape update is applied to the SH template with
+reorientation by the Jacobian of the update (``ants.apply_transforms`` cannot
+do this: it treats a vector image either as scalars or as displacement
+vectors), and the Laplacian sharpening is applied per coefficient.
 """
 
 from __future__ import annotations
@@ -24,10 +32,135 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import ants
 import numpy as np
+import torch
+
+from .._torch_compat import grid_sample
+from ..ants_transform_io import read_affine_transform
+from .bridge import (
+    ants_image_metadata,
+    ants_image_to_tensor,
+    flip_affine_xyz_to_zyx,
+    metadata_tensors_from_dict,
+    tensor_to_ants_image,
+)
+from .core.grid import get_physical_grid_torch, physical_to_normalized_torch_cached
+from .fod import FODRegistration, direction_transform, pullback_jacobian, sh_lmax_of_image
 
 __all__ = ["build_template"]
 
 _MANAGED_KWARGS = ("initial_affine", "outprefix")
+
+
+def _sample_like_itk(tensor: torch.Tensor, coords: torch.Tensor, shape_t: torch.Tensor) -> torch.Tensor:
+    """Trilinear sampling with ITK's boundary semantics (what ``ants.apply_transforms`` does).
+
+    ITK's linear interpolator clamps neighbor indices to the buffer, so points
+    within half a voxel beyond the outermost voxel centers get the edge value
+    ("border" padding), and points further out get the default value 0.
+    ``coords`` are normalized grid_sample coordinates (``(x, y, z)`` order);
+    ``shape_t`` is the torch (reversed) spatial shape.
+    """
+    sampled = grid_sample(tensor, coords, mode="bilinear", padding_mode="border", align_corners=True)
+    dim = coords.shape[-1]
+    inside = None
+    for d in range(dim):
+        size = shape_t[dim - 1 - d].to(coords.dtype)
+        limit = 1.0 + 1.0 / (size - 1.0).clamp_min(1.0)
+        axis_inside = coords[..., d].abs() <= limit
+        inside = axis_inside if inside is None else (inside & axis_inside)
+    return sampled * inside.unsqueeze(1).to(sampled.dtype)
+
+
+def _resample_vector_onto(image: ants.ANTsImage, target: ants.ANTsImage, device="cpu") -> ants.ANTsImage:
+    """Trilinear resampling of a (multi-component) image onto ``target``'s grid through the identity map.
+
+    ``ants.resample_image_to_target`` crashes on multi-component images (ANTsPy
+    0.6.3), so the resampling is done in torch; no reorientation is needed for
+    the identity map, so this is valid for SH images too.
+    """
+    if (
+        tuple(image.shape) == tuple(target.shape)
+        and np.allclose(image.spacing, target.spacing)
+        and np.allclose(image.origin, target.origin)
+        and np.allclose(np.asarray(image.direction), np.asarray(target.direction))
+    ):
+        return image.clone()
+    source_meta = ants_image_metadata(image)
+    target_meta = ants_image_metadata(target)
+    tensor = ants_image_to_tensor(image, device, torch.float32, normalize=False)
+    X = get_physical_grid_torch(
+        target_meta["torch_shape"], target_meta["spacing"], target_meta["origin"], target_meta["direction"], device=device
+    )
+    mt = metadata_tensors_from_dict(source_meta, torch.device(device), torch.float32)
+    coords = physical_to_normalized_torch_cached(X, mt["shape_t"], mt["spacing_t"], mt["origin_t"], mt["direction_t"])
+    resampled = _sample_like_itk(tensor, coords, mt["shape_t"])
+    return tensor_to_ants_image(resampled, target)
+
+
+def _warp_sh_template(
+    template: ants.ANTsImage,
+    scaled_warp: Optional[ants.ANTsImage],
+    affine_fn: Optional[str],
+    fod_tools: FODRegistration,
+) -> ants.ANTsImage:
+    """``ants.apply_transforms(fixed=template, moving=template, [warp, affine], whichtoinvert=[0, 1])`` for an SH template.
+
+    The template is sampled at ``phi(x) = A^-1 ((x + w(x)) - t)`` (the warp
+    first, then the inverted average affine, ANTs' order for the transform
+    list) and every FOD is reoriented by ``(d phi / d x)^-1`` with the apodized
+    PSF method, exactly as the warped outputs of
+    :func:`antstorch.syn.syn_registration` are.
+    """
+    device = fod_tools.device if fod_tools.device is not None else "cpu"
+    meta = ants_image_metadata(template)
+    tensor = ants_image_to_tensor(template, device, torch.float32, normalize=False)  # (1, C, z, y, x)
+    X = get_physical_grid_torch(meta["torch_shape"], meta["spacing"], meta["origin"], meta["direction"], device=device)
+    if scaled_warp is not None:
+        warp_xyz = ants_image_to_tensor(scaled_warp, device, torch.float32, normalize=False)[0]  # (3, z, y, x)
+        displacement = warp_xyz.movedim(0, -1).flip(-1).unsqueeze(0)  # (1, z, y, x, 3), (z, y, x) components
+    else:
+        displacement = torch.zeros_like(X)
+    points = X + displacement
+    affine_zyx = None
+    if affine_fn is not None:
+        matrix, translation = read_affine_transform(affine_fn, 3)  # y = M x + t in ITK physical coordinates
+        inverse_matrix = np.linalg.inv(matrix)
+        inverse_translation = -inverse_matrix @ translation
+        affine_zyx, translation_zyx = flip_affine_xyz_to_zyx(
+            torch.as_tensor(inverse_matrix, dtype=torch.float32), torch.as_tensor(inverse_translation, dtype=torch.float32)
+        )
+        affine_zyx = affine_zyx.to(device)
+        points = points @ affine_zyx.transpose(0, 1) + translation_zyx.to(device)
+    mt = metadata_tensors_from_dict(meta, torch.device(device), torch.float32)
+    coords = physical_to_normalized_torch_cached(points, mt["shape_t"], mt["spacing_t"], mt["origin_t"], mt["direction_t"])
+    warped = _sample_like_itk(tensor, coords, mt["shape_t"])
+    reorienter = fod_tools.reorienter(fod_tools.image_lmax)
+    if reorienter is not None:
+        jacobian = pullback_jacobian(displacement, meta["spacing"], meta["direction"], affine=affine_zyx)
+        warped = reorienter.reorient(
+            warped, direction_transform(jacobian, fod_tools.sh_frame), modulate=fod_tools.modulate_output,
+            chunk_size=fod_tools.chunk_size,
+        )
+    return tensor_to_ants_image(warped, template)
+
+
+def _sharpen_vector_image(image: ants.ANTsImage, blending_weight: float) -> ants.ANTsImage:
+    """``w * image + (1 - w) * Sharpen(image)`` applied per component (``ants.iMath`` Sharpen is scalar only)."""
+    array = np.asarray(image.numpy(), dtype=np.float32)
+    out = np.empty_like(array)
+    for c in range(array.shape[-1]):
+        if not np.isfinite(array[..., c]).all() or array[..., c].max() == array[..., c].min():
+            # ITK's Laplacian sharpening rescales by the intensity range: NaN on a constant channel.
+            out[..., c] = array[..., c]
+            continue
+        channel = ants.from_numpy(
+            np.ascontiguousarray(array[..., c]), origin=image.origin, spacing=image.spacing, direction=image.direction
+        )
+        sharpened = ants.iMath(channel, "Sharpen").numpy()
+        out[..., c] = blending_weight * array[..., c] + (1.0 - blending_weight) * sharpened
+    return ants.from_numpy(
+        np.ascontiguousarray(out), origin=image.origin, spacing=image.spacing, direction=image.direction, has_components=True
+    )
 
 
 def _normalize_weights(weights: Optional[Sequence[float]], n: int) -> np.ndarray:
@@ -49,7 +182,10 @@ def _initial_template(image_list: List[ants.ANTsImage], weights: Sequence[float]
     """Weighted average of ``image_list``, resampled onto the first image."""
     template = image_list[0] * 0
     for image, weight in zip(image_list, weights):
-        template = template + ants.resample_image_to_target(image * float(weight), template)
+        if image.components > 1:
+            template = template + _resample_vector_onto(image, template) * float(weight)
+        else:
+            template = template + ants.resample_image_to_target(image * float(weight), template)
     return template
 
 
@@ -181,7 +317,11 @@ def build_template(
     **kwargs
         Forwarded to ``syn_registration`` (``regularizer``, ``syn_metric``,
         ``levels``, ``reg_iterations``, ``device``, ...).  ``initial_affine`` and
-        ``outprefix`` are managed here and rejected.
+        ``outprefix`` are managed here and rejected.  ``fod=True`` (with the
+        optional ``fod_lmax``, ``fod_directions``, ``fod_modulate``) builds a
+        template of spherical harmonic FOD images: the registrations reorient
+        the FODs, the shape update is applied to the SH template with
+        reorientation, and sharpening is applied per coefficient.
 
     Returns
     -------
@@ -209,6 +349,23 @@ def build_template(
 
     n = len(image_list)
     weights = _normalize_weights(weights, n)
+
+    # FOD (spherical harmonic) inputs: the registrations handle the reorientation
+    # (``fod=True`` is forwarded to syn_registration); the template-side steps
+    # below need their own SH-aware versions.
+    fod_tools: Optional[FODRegistration] = None
+    if kwargs.get("fod", False):
+        components = image_list[0].components
+        if any(image.components != components for image in image_list):
+            raise ValueError("all FOD images must have the same number of spherical harmonic coefficients")
+        image_lmax = sh_lmax_of_image(image_list[0])
+        fod_device = kwargs.get("device")
+        if fod_device is None:
+            fod_device = "cuda" if torch.cuda.is_available() else "cpu"
+        fod_tools = FODRegistration(
+            image_lmax, (image_lmax,), directions=kwargs.get("fod_directions", 60),
+            modulate_output=bool(kwargs.get("fod_modulate", False)), device=fod_device, dtype=torch.float32,
+        )
 
     work_dir = tempfile.mkdtemp(prefix="antstorch_tmpl_") if output_dir is None else output_dir
     os.makedirs(work_dir, exist_ok=True)
@@ -304,26 +461,38 @@ def build_template(
             affine_fn = os.path.join(work_dir, f"avgAffine_{it}.mat")
             ants.write_transform(avg_affine, affine_fn)
 
+        # antsApplyTransforms only needs the reference geometry from ``fixed``; a scalar
+        # channel keeps it away from the multi-component template.
+        reference = xavg_new if fod_tools is None else fod_tools.scalar_channel(xavg_new)
         if has_field and wavg is not None:
             scaled = wavg * ((-1.0) * gradient_step)
             if affine_fn is not None:
-                scaled = _apply_affine_to_vectors(xavg_new, scaled, affine_fn, invert=True)
+                scaled = _apply_affine_to_vectors(reference, scaled, affine_fn, invert=True)
             warp_fn = os.path.join(work_dir, f"avgWarp_{it}.nii.gz")
             ants.image_write(scaled, warp_fn)
-            transforms = [warp_fn] + ([affine_fn] if affine_fn is not None else [])
-            invert = [0] + ([1] if affine_fn is not None else [])
-            xavg = ants.apply_transforms(
-                fixed=xavg_new, moving=xavg_new, transformlist=transforms, whichtoinvert=invert
-            )
+            if fod_tools is not None:
+                xavg = _warp_sh_template(xavg_new, scaled, affine_fn, fod_tools)
+            else:
+                transforms = [warp_fn] + ([affine_fn] if affine_fn is not None else [])
+                invert = [0] + ([1] if affine_fn is not None else [])
+                xavg = ants.apply_transforms(
+                    fixed=xavg_new, moving=xavg_new, transformlist=transforms, whichtoinvert=invert
+                )
         elif affine_fn is not None:
-            xavg = ants.apply_transforms(
-                fixed=xavg_new, moving=xavg_new, transformlist=[affine_fn], whichtoinvert=[1]
-            )
+            if fod_tools is not None:
+                xavg = _warp_sh_template(xavg_new, None, affine_fn, fod_tools)
+            else:
+                xavg = ants.apply_transforms(
+                    fixed=xavg_new, moving=xavg_new, transformlist=[affine_fn], whichtoinvert=[1]
+                )
         else:
             xavg = xavg_new
 
         if blending_weight < 1.0:
-            xavg = xavg * blending_weight + ants.iMath(xavg, "Sharpen") * (1.0 - blending_weight)
+            if fod_tools is not None:
+                xavg = _sharpen_vector_image(xavg, blending_weight)
+            else:
+                xavg = xavg * blending_weight + ants.iMath(xavg, "Sharpen") * (1.0 - blending_weight)
 
         change = _template_change(xavg_pre, xavg)
         convergence.append(change)

@@ -139,7 +139,9 @@ def read_affine_transform(filename: str, dim: int) -> Tuple[np.ndarray, np.ndarr
         raise ValueError(
             f"transform at '{filename}' has dimension {transform.dimension}, expected {dim}"
         )
-    if transform.transform_type != "AffineTransform":
+    # ants.average_affine_transform* write their result as a MatrixOffsetTransformBase,
+    # which has the same (matrix, translation; center) parameterization as an AffineTransform.
+    if transform.transform_type not in ("AffineTransform", "MatrixOffsetTransformBase"):
         raise ValueError(
             f"transform at '{filename}' has type '{transform.transform_type}', expected 'AffineTransform'"
         )

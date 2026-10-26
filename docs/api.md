@@ -10,6 +10,7 @@ Registration-specific APIs can also be imported from their subpackages.
 | `antstorch.brain_extraction` | ANTsImage and modality | Probability image for `t1`; other modalities can return different structures |
 | `antstorch.deep_atropos` | T1 image and preprocessing options | Dictionary containing segmentation and probability images |
 | `antstorch.syn.syn_registration` | Fixed and moving ANTsImages, scalar or multi-component (`fod=True` for spherical harmonic FOD images) | Warped images and file-based transform lists |
+| `antstorch.syn.build_template` | List of ANTsImages, scalar or FOD (`fod=True`) | Unbiased group template, per-image warped images and transforms |
 | `antstorch.syn.fod.fod_image_read` / `fod_image_write` | MRtrix3 spherical harmonic images stored as 4-D NIfTI | Multi-component ANTsImage, and back |
 | `antstorch.syn.sh.FODReorienter` | SH image and per-voxel direction maps | Reoriented SH image (apodized point spread function method) |
 | `antstorch.bspline_flows.n4_bias_field_correction_tensor` | Image tensor, domain, optional mask | Corrected image tensor or bias field |
