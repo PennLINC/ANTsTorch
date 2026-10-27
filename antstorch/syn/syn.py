@@ -1779,6 +1779,11 @@ def syn_registration(
         level_loss_history.append(history)
 
     loss_history = [value for level in level_loss_history for value in level]
+    # The registration tensors are no longer needed; the outputs are resampled from the
+    # original images. Freeing them matters on small GPUs with many-channel images.
+    del I_full, J_full, I_source, J_source, I_level, J_level, I_extra, J_extra
+    if resolved_device.type == "cuda":
+        torch.cuda.empty_cache()
 
     # --- Final algebraic forward/inverse construction (half-warp swap) ------
     fixed_meta_t_full = metadata_tensors_from_dict(fixed_meta_full, resolved_device, dtype)

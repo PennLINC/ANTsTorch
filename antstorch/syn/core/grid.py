@@ -7,6 +7,9 @@ metadata (spacing, origin, direction) is supplied in ITK ``(x, y[, z])``
 order, and tensor spatial axes are the PyTorch-reversed ``(z, y, x)``.
 """
 
+import itertools
+import math
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -39,8 +42,14 @@ def _catmull_rom_weights(u):
     return [w0, w1, w2, w3]
 
 
-def _grid_sample_separable_cubic(image, grid, get_w, padding_mode='border', align_corners=True):
-    """Shared 4-tap separable sampler behind :func:`grid_sample_bspline_torch` and :func:`grid_sample_cubic_torch`."""
+def _grid_sample_separable_cubic(image, grid, get_w, padding_mode='border', align_corners=True, max_chunk_elements=1 << 25):
+    """Shared 4-tap separable sampler behind :func:`grid_sample_bspline_torch` and :func:`grid_sample_cubic_torch`.
+
+    The per-axis tap indices and weights are computed once; the ``4**ndim`` taps are then gathered and
+    accumulated in place, in channel chunks of at most ``max_chunk_elements`` output elements each, so the
+    peak memory stays near one output image plus one chunk however many channels ``image`` has (a 45-channel
+    spherical harmonic volume at 1.25 mm would otherwise need several extra copies per tap).
+    """
     ndim = image.ndim - 2
     if ndim not in (2, 3):
         raise ValueError(f"Only 2-D and 3-D grid sampling are supported, got ndim={ndim}")
@@ -48,76 +57,47 @@ def _grid_sample_separable_cubic(image, grid, get_w, padding_mode='border', alig
         raise ValueError(f"padding_mode must be 'border' or 'zeros', got {padding_mode!r}")
 
     B, C = image.shape[:2]
-    device = image.device
-    dtype = image.dtype
-    spatial_target = grid.shape[1:-1]
+    sizes = tuple(int(n) for n in image.shape[2:])
+    spatial_target = tuple(grid.shape[1:-1])
+    n_target = int(math.prod(spatial_target))
 
-    if ndim == 2:
-        H, W = image.shape[2:]
-        gx, gy = grid[..., 0], grid[..., 1]
-        vx = (gx + 1.0) * (W - 1) / 2.0 if align_corners else (gx + 1.0) * W / 2.0 - 0.5
-        vy = (gy + 1.0) * (H - 1) / 2.0 if align_corners else (gy + 1.0) * H / 2.0 - 0.5
-        ix, iy = torch.floor(vx), torch.floor(vy)
-        ux, uy = vx - ix, vy - iy
-        wx, wy = get_w(ux), get_w(uy)
+    # Per spatial axis (image order; grid's last axis lists (x, y[, z]), the reverse), the four taps'
+    # clamped indices, in-bounds flags and weights.
+    axes = []
+    for d in range(ndim):
+        g = grid[..., ndim - 1 - d]
+        n = sizes[d]
+        v = (g + 1.0) * (n - 1) / 2.0 if align_corners else (g + 1.0) * n / 2.0 - 0.5
+        i0 = torch.floor(v)
+        w = get_w(v - i0)
+        taps = []
+        for k in range(4):
+            j_raw = (i0 + k - 1).long()
+            taps.append((j_raw.clamp(0, n - 1), (j_raw >= 0) & (j_raw < n), w[k]))
+        axes.append(taps)
+    strides = [1] * ndim
+    for d in range(ndim - 2, -1, -1):
+        strides[d] = strides[d + 1] * sizes[d + 1]
 
-        out = torch.zeros((B, C, *spatial_target), device=device, dtype=dtype)
-        img_flat = image.reshape(B, C, H * W)
-
-        for ky in range(4):
-            jy_raw = (iy + ky - 1).long()
-            jy = jy_raw.clamp(0, H - 1)
-            valid_y = (jy_raw >= 0) & (jy_raw < H)
-            w_y = wy[ky].unsqueeze(1)
-            for kx in range(4):
-                jx_raw = (ix + kx - 1).long()
-                jx = jx_raw.clamp(0, W - 1)
-                valid_x = (jx_raw >= 0) & (jx_raw < W)
-                w_yx = w_y * wx[kx].unsqueeze(1)
-                idx = (jy * W + jx).reshape(B, 1, -1).expand(B, C, -1)
-                sampled_flat = torch.gather(img_flat, 2, idx)
-                sampled = sampled_flat.view(B, C, *spatial_target)
-                if padding_mode == 'zeros':
-                    valid_mask = (valid_y & valid_x).view(B, 1, *spatial_target)
-                    sampled = sampled * valid_mask
-                out = out + w_yx * sampled
-        return out
-    else:
-        D, H, W = image.shape[2:]
-        gx, gy, gz = grid[..., 0], grid[..., 1], grid[..., 2]
-        vx = (gx + 1.0) * (W - 1) / 2.0 if align_corners else (gx + 1.0) * W / 2.0 - 0.5
-        vy = (gy + 1.0) * (H - 1) / 2.0 if align_corners else (gy + 1.0) * H / 2.0 - 0.5
-        vz = (gz + 1.0) * (D - 1) / 2.0 if align_corners else (gz + 1.0) * D / 2.0 - 0.5
-        ix, iy, iz = torch.floor(vx), torch.floor(vy), torch.floor(vz)
-        ux, uy, uz = vx - ix, vy - iy, vz - iz
-        wx, wy, wz = get_w(ux), get_w(uy), get_w(uz)
-
-        out = torch.zeros((B, C, *spatial_target), device=device, dtype=dtype)
-        img_flat = image.reshape(B, C, D * H * W)
-
-        for kz in range(4):
-            jz_raw = (iz + kz - 1).long()
-            jz = jz_raw.clamp(0, D - 1)
-            valid_z = (jz_raw >= 0) & (jz_raw < D)
-            w_z = wz[kz].unsqueeze(1)
-            for ky in range(4):
-                jy_raw = (iy + ky - 1).long()
-                jy = jy_raw.clamp(0, H - 1)
-                valid_y = (jy_raw >= 0) & (jy_raw < H)
-                w_zy = w_z * wy[ky].unsqueeze(1)
-                for kx in range(4):
-                    jx_raw = (ix + kx - 1).long()
-                    jx = jx_raw.clamp(0, W - 1)
-                    valid_x = (jx_raw >= 0) & (jx_raw < W)
-                    w_zyx = w_zy * wx[kx].unsqueeze(1)
-                    idx = (jz * (H * W) + jy * W + jx).reshape(B, 1, -1).expand(B, C, -1)
-                    sampled_flat = torch.gather(img_flat, 2, idx)
-                    sampled = sampled_flat.view(B, C, *spatial_target)
-                    if padding_mode == 'zeros':
-                        valid_mask = (valid_z & valid_y & valid_x).view(B, 1, *spatial_target)
-                        sampled = sampled * valid_mask
-                    out = out + w_zyx * sampled
-        return out
+    img_flat = image.reshape(B, C, int(math.prod(sizes)))
+    chunk = max(1, min(C, max_chunk_elements // max(1, n_target)))
+    out = torch.zeros((B, C, *spatial_target), device=image.device, dtype=image.dtype)
+    for combo in itertools.product(range(4), repeat=ndim):
+        idx = valid = w = None
+        for d, k in enumerate(combo):
+            j, ok, wk = axes[d][k]
+            idx = j * strides[d] if idx is None else idx + j * strides[d]
+            valid = ok if valid is None else valid & ok
+            w = wk if w is None else w * wk
+        idx = idx.reshape(B, 1, n_target)
+        w = w.unsqueeze(1)
+        if padding_mode == 'zeros':
+            w = w * valid.unsqueeze(1).to(w.dtype)  # a zero weight for out-of-bounds taps
+        for c0 in range(0, C, chunk):
+            c1 = min(C, c0 + chunk)
+            sampled = torch.gather(img_flat[:, c0:c1], 2, idx.expand(B, c1 - c0, n_target)).view(B, c1 - c0, *spatial_target)
+            out[:, c0:c1].addcmul_(w, sampled)
+    return out
 
 
 def grid_sample_bspline_torch(
