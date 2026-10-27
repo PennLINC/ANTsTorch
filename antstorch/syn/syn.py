@@ -781,8 +781,11 @@ def _fit_syn_level(
                     enforce_stationary_boundary=bspline_enforce_stationary_boundary,
                 )
         elif total_sigma > 0:
-            warp_l2r = separable_gaussian_filter(warp_l2r, total_sigma, spacing=fixed_meta["spacing"], sigma_mode="physical")
-            warp_r2l = separable_gaussian_filter(warp_r2l, total_sigma, spacing=fixed_meta["spacing"], sigma_mode="physical")
+            # Same units as flow_sigma: voxels of the current level under the default gaussian_sigma_mode='voxel',
+            # the way antsRegistration's SyN[step, updateFieldVarianceInVoxelSpace, totalFieldVarianceInVoxelSpace]
+            # keeps both variances in voxel space and constant across levels.
+            warp_l2r = separable_gaussian_filter(warp_l2r, total_sigma, spacing=fixed_meta["spacing"], sigma_mode=gaussian_sigma_mode)
+            warp_r2l = separable_gaussian_filter(warp_r2l, total_sigma, spacing=fixed_meta["spacing"], sigma_mode=gaussian_sigma_mode)
 
         # Nothing inside this loop reads warp_*_inv (prepare_mid_images_and_
         # gradients_torch accepts them but never uses them); they only feed the
@@ -1150,6 +1153,19 @@ def syn_registration(
     both. Neither default changes this port's own long-standing behavior;
     both exist to let a caller reproduce ``syntx.syn``'s numbers when that is
     the goal.
+
+    ``total_sigma`` is read in the same units as ``flow_sigma``, set by
+    ``gaussian_sigma_mode``: with the default ``'voxel'`` both are standard
+    deviations in voxels of the current pyramid level and stay the same
+    number at every level, exactly as ``antsRegistration``'s
+    ``SyN[gradientStep, updateFieldVarianceInVoxelSpace,
+    totalFieldVarianceInVoxelSpace]`` keeps both Gaussian variances in
+    voxel space and unchanged across levels (sigma is the square root of
+    the ANTs variance, so ANTs' default ``SyN[0.1,3,0]`` is
+    ``flow_sigma=sqrt(3)``, ``total_sigma=0``). With ``'physical'`` both
+    are in millimeters, divided by the level's spacing per axis and
+    clamped to 0.5 to 10 voxels. (Before this change ``total_sigma`` was
+    always physical regardless of the mode.)
 
     ``regularizer='bspline'`` is the ANTs/ITK ``BSplineSyN`` regularizer: a
     single-level cubic B-spline fit (via

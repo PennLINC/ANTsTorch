@@ -25,7 +25,7 @@ def main():
     parser.add_argument("--blending-weight", type=float, default=0.75, help="1 disables sharpening")
     parser.add_argument("--metric", default="lncc_joint")
     parser.add_argument("--flow-sigma", type=float, default=2.0, help="update field smoothing (voxels)")
-    parser.add_argument("--total-sigma", type=float, default=2.0, help="total field smoothing (mm; 0 disables)")
+    parser.add_argument("--total-sigma", type=float, default=1.0, help="total field smoothing (voxels of the current level, like flow_sigma; 0 disables)")
     parser.add_argument("--reg-iterations", type=int, nargs="+", default=(50, 50, 50))
     parser.add_argument("--output-interpolator", default="cubic", choices=("linear", "cubic", "bspline", "nearest"),
                         help="interpolation of the warped images and of the template in the shape update")

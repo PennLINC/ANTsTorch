@@ -21,7 +21,7 @@ def main():
     parser.add_argument("--type", default="SyN", dest="type_of_transform", help="'SyN' (affine on the l=0 term, then SyN) or 'SyNOnly'")
     parser.add_argument("--lmax", type=int, nargs="+", default=None, help="lmax per pyramid level (default 0 2 4)")
     parser.add_argument("--flow-sigma", type=float, default=3.0, help="update field smoothing (voxels)")
-    parser.add_argument("--total-sigma", type=float, default=0.0, help="total field smoothing (mm; 0 disables)")
+    parser.add_argument("--total-sigma", type=float, default=0.0, help="total field smoothing (voxels of the current level, like flow_sigma; 0 disables)")
     parser.add_argument("--iterations", type=int, nargs="+", default=(100, 70, 50))
     parser.add_argument("--modulate", action="store_true", help="apply FOD modulation to the warped output")
     parser.add_argument("--output-interpolator", default="cubic", choices=("linear", "cubic", "bspline", "nearest"),
