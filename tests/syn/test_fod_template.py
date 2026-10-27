@@ -244,3 +244,30 @@ def test_build_template_without_extra_contrasts_returns_empty_extra_lists(tmp_pa
         image_list=images, iterations=1, output_dir=str(tmp_path), type_of_transform="SyNOnly", levels=(1,), reg_iterations=(1,), device="cpu"
     )
     assert result["extra_templates"] == [] and result["warped_extra_images"] == []
+
+
+def test_build_template_continues_from_previous_templates(tmp_path):
+    centers = ((6, 6, 7), (5, 7, 8), (7, 6, 6))
+    images = [_fod_image((12, 13, 14), c) for c in centers]
+    extras = [_scalar_blob((12, 13, 14), c) * 3.0 for c in centers]
+    common = dict(
+        gradient_step=0.2, type_of_transform="SyN", fod=True, levels=(2, 1), reg_iterations=(3, 2), affine_iterations=(10, 10, 10),
+        affine_multi_start=False, device="cpu", blending_weight=1.0,
+    )
+    first = build_template(image_list=images, extra_contrasts=[extras], iterations=1, output_dir=str(tmp_path / "first"), **common)
+    second = build_template(
+        image_list=images, extra_contrasts=[extras], iterations=1, output_dir=str(tmp_path / "second"),
+        initial_template=first["template"], initial_extra_templates=first["extra_templates"], **common,
+    )
+    assert second["n_iterations"] == 1
+    extra_template = second["extra_templates"][0]
+    assert extra_template.components == 1 and tuple(extra_template.shape) == tuple(first["template"].shape)
+    assert np.isfinite(extra_template.numpy()).all()
+    # One more iteration refines the extra template; it stays an average of the inputs rather than restarting from scratch.
+    assert 0.5 * 3.0 < extra_template.numpy().max() <= 3.0 * 1.05
+    assert np.abs(extra_template.numpy() - first["extra_templates"][0].numpy()).max() < 0.5 * 3.0
+    with pytest.raises(ValueError, match="initial_extra_templates must hold one image per extra contrast"):
+        build_template(
+            image_list=images, extra_contrasts=[extras], iterations=1, output_dir=str(tmp_path / "bad"),
+            initial_template=first["template"], initial_extra_templates=[], **common,
+        )

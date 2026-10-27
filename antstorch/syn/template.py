@@ -338,6 +338,23 @@ def _apply_affine_to_vectors(fixed, moving, affine_file: str, invert: bool = Tru
         return _apply_affine_to_vector_image(fixed, moving, affine_file, invert)
 
 
+def _initial_extra_templates(extras, initial_extra_templates, weights, interpolator, primary, device):
+    """Starting templates of the extra contrasts: their weighted averages, or the given images resampled onto the primary's grid."""
+    if initial_extra_templates is None:
+        return [_initial_template(contrast, weights, interpolator) for contrast in extras]
+    if len(initial_extra_templates) != len(extras):
+        raise ValueError(
+            f"initial_extra_templates must hold one image per extra contrast ({len(extras)}), got {len(initial_extra_templates)}"
+        )
+    target = primary if primary.components == 1 else FODRegistration.scalar_channel(primary)
+    templates = []
+    for c, image in enumerate(initial_extra_templates):
+        if image.components != 1:
+            raise ValueError(f"initial_extra_templates[{c}] must be a scalar image, got {image.components} components")
+        templates.append(_resample_vector_onto(image, target, device=device, interpolator=interpolator))
+    return templates
+
+
 def build_template(
     initial_template: Optional[ants.ANTsImage] = None,
     image_list: Optional[List[ants.ANTsImage]] = None,
@@ -352,6 +369,7 @@ def build_template(
     affine_every_iteration: bool = False,
     extra_contrasts: Optional[Sequence[Sequence[ants.ANTsImage]]] = None,
     extra_contrast_weights: Optional[Sequence[float]] = None,
+    initial_extra_templates: Optional[Sequence[ants.ANTsImage]] = None,
     verbose: bool = False,
     **kwargs: Any,
 ) -> Dict[str, Any]:
@@ -402,6 +420,13 @@ def build_template(
     extra_contrast_weights : sequence of float, optional
         Weight of each extra contrast in the similarity (default 1 each; see
         ``syn_registration``).
+    initial_extra_templates : sequence of ants.ANTsImage, optional
+        Starting template of each extra contrast (one scalar image per entry
+        of ``extra_contrasts``, resampled onto the primary template's grid):
+        together with ``initial_template`` this continues a build from a
+        previous result's ``template`` and ``extra_templates``, which is
+        how more iterations are added without starting over.  Default: the
+        weighted average of each contrast.
     verbose : bool, default False
     **kwargs
         Forwarded to ``syn_registration`` (``regularizer``, ``syn_metric``,
@@ -481,7 +506,7 @@ def build_template(
         return os.path.join(d, "out")
 
     xavg = _initial_template(image_list, weights, interpolator) if initial_template is None else initial_template.clone()
-    xavg_extras = [_initial_template(contrast, weights, interpolator) for contrast in extras]
+    xavg_extras = _initial_extra_templates(extras, initial_extra_templates, weights, interpolator, xavg, torch_device)
 
     shape_residuals: List[Dict[str, float]] = []
     convergence: List[float] = []
