@@ -206,6 +206,10 @@ class FODRegistration:
         Voxels per reorientation batch.
     sh_frame : str
         Frame of the SH basis, ``'RAS'`` for MRtrix3 images.
+    extra_channels : int
+        Number of non-SH channels (extra contrasts) appended after the SH
+        coefficients of the images: they are registered at every level
+        alongside the series and are never reoriented.
     device, dtype
         Where the reorientation matrices live.
     """
@@ -219,6 +223,7 @@ class FODRegistration:
         modulate_output: bool = False,
         chunk_size: int = 1 << 14,
         sh_frame: str = "RAS",
+        extra_channels: int = 0,
         device=None,
         dtype: torch.dtype = torch.float32,
     ):
@@ -233,6 +238,9 @@ class FODRegistration:
         self.modulate_output = bool(modulate_output)
         self.chunk_size = int(chunk_size)
         self.sh_frame = sh_frame
+        self.extra_channels = int(extra_channels)
+        if self.extra_channels < 0:
+            raise ValueError(f"extra_channels must be non-negative, got {extra_channels}")
         self.device = device
         self.dtype = dtype
         self._reorienters: Dict[int, FODReorienter] = {}
@@ -245,10 +253,24 @@ class FODRegistration:
             self._reorienters[lmax] = FODReorienter(lmax, self.directions, device=self.device, dtype=self.dtype)
         return self._reorienters[lmax]
 
+    def channels(self, image: Tensor, lmax: int) -> Tensor:
+        """The channels registered at a level: the SH series up to ``lmax`` plus the trailing extra-contrast channels."""
+        sh_part = image[:, : n_coefficients(lmax)]
+        if self.extra_channels == 0:
+            return sh_part
+        return torch.cat([sh_part, image[:, image.shape[1] - self.extra_channels :]], dim=1)
+
     @staticmethod
-    def channels(image: Tensor, lmax: int) -> Tensor:
-        """The leading channels of a channel-first SH image that make up the series up to ``lmax``."""
-        return image[:, : n_coefficients(lmax)]
+    def split(image: Tensor, lmax: int) -> Tuple[Tensor, Tensor]:
+        """Split a ``[SH series up to lmax | extra channels]`` tensor into its SH and extra parts (the latter possibly empty)."""
+        n = n_coefficients(lmax)
+        return image[:, :n], image[:, n:]
+
+    def _reorient(self, reorienter: FODReorienter, image: Tensor, transform: Tensor, lmax: int, modulate: bool = False) -> Tensor:
+        """Reorient the SH part of ``image`` (series up to ``lmax``) and carry its extra channels through unchanged."""
+        sh_part, extras = self.split(image, lmax)
+        out = reorienter.reorient(sh_part, transform, modulate=modulate, chunk_size=self.chunk_size)
+        return out if extras.shape[1] == 0 else torch.cat([out, extras], dim=1)
 
     @staticmethod
     def scalar_channel(image):
@@ -286,7 +308,7 @@ class FODRegistration:
         if reorienter is None:
             return None
         spacing, direction = fixed_meta["spacing"], fixed_meta["direction"]
-        chunk_size, sh_frame = self.chunk_size, self.sh_frame
+        sh_frame = self.sh_frame
 
         def hook(I_mid: Tensor, J_mid: Tensor, warp_l2r: Tensor, warp_r2l: Tensor) -> Tuple[Tensor, Tensor]:
             with torch.no_grad():
@@ -295,8 +317,8 @@ class FODRegistration:
                     pullback_jacobian(warp_r2l.detach(), spacing, direction, affine=M_phys.detach()), sh_frame
                 )
             return (
-                reorienter.reorient(I_mid, transform_fixed, chunk_size=chunk_size),
-                reorienter.reorient(J_mid, transform_moving, chunk_size=chunk_size),
+                self._reorient(reorienter, I_mid, transform_fixed, lmax),
+                self._reorient(reorienter, J_mid, transform_moving, lmax),
             )
 
         return hook
@@ -308,9 +330,7 @@ class FODRegistration:
             return image
         with torch.no_grad():
             transform = direction_transform(pullback_jacobian(displacement, meta["spacing"], meta["direction"]), self.sh_frame)
-        return reorienter.reorient(
-            image, transform, modulate=self.modulate_output if modulate is None else modulate, chunk_size=self.chunk_size
-        )
+        return self._reorient(reorienter, image, transform, self.image_lmax, self.modulate_output if modulate is None else modulate)
 
     def reorient_affine(self, image: Tensor, matrix_xyz: Tensor, modulate: Optional[bool] = None) -> Tensor:
         """Reorient a full-lmax image resampled through the pull-back affine ``x -> matrix_xyz x + t`` (ITK ``(x, y, z)`` order)."""
@@ -319,6 +339,4 @@ class FODRegistration:
             return image
         jacobian = matrix_xyz.detach().to(device=image.device, dtype=image.dtype)
         transform = direction_transform(jacobian, self.sh_frame)
-        return reorienter.reorient(
-            image, transform, modulate=self.modulate_output if modulate is None else modulate, chunk_size=self.chunk_size
-        )
+        return self._reorient(reorienter, image, transform, self.image_lmax, self.modulate_output if modulate is None else modulate)

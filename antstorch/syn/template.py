@@ -166,6 +166,57 @@ def _warp_sh_template(
     return tensor_to_ants_image(warped, template)
 
 
+def _prepare_template_extras(
+    image_list: List[ants.ANTsImage], extra_contrasts, interpolator: str, device
+) -> List[List[ants.ANTsImage]]:
+    """The extra contrasts of :func:`build_template` as lists of scalar images on their primary images' grids.
+
+    ``extra_contrasts[c][k]`` belongs to ``image_list[k]``; an image on another grid (a 1 mm
+    T1-weighted volume next to a 1.8 mm FOD image, say) is resampled onto the primary grid
+    with ``interpolator``, since the template shape update shares one grid between the contrasts.
+    """
+    extras: List[List[ants.ANTsImage]] = []
+    for c, contrast in enumerate(extra_contrasts or ()):
+        contrast = list(contrast)
+        if len(contrast) != len(image_list):
+            raise ValueError(
+                f"extra_contrasts[{c}] must hold one image per entry of image_list ({len(image_list)}), got {len(contrast)}"
+            )
+        resampled = []
+        for image, primary in zip(contrast, image_list):
+            if image.components != 1:
+                raise ValueError(f"extra_contrasts[{c}]: extra contrasts must be scalar images, got {image.components} components")
+            target = primary if primary.components == 1 else FODRegistration.scalar_channel(primary)
+            resampled.append(_resample_vector_onto(image, target, device=device, interpolator=interpolator))
+        extras.append(resampled)
+    return extras
+
+
+def _apply_shape_update(
+    image: ants.ANTsImage,
+    tools: Optional[FODRegistration],
+    scaled_warp: Optional[ants.ANTsImage],
+    warp_fn: Optional[str],
+    affine_fn: Optional[str],
+    use_torch: bool,
+    interpolator: str,
+    device,
+) -> ants.ANTsImage:
+    """Move a template (or an extra-contrast template) by the scaled mean warp and the inverted average affine."""
+    if scaled_warp is None and affine_fn is None:
+        return image
+    if use_torch:
+        return _warp_sh_template(image, scaled_warp, affine_fn, tools, interpolator, device)
+    transforms = ([warp_fn] if warp_fn is not None else []) + ([affine_fn] if affine_fn is not None else [])
+    invert = ([0] if warp_fn is not None else []) + ([1] if affine_fn is not None else [])
+    return ants.apply_transforms(fixed=image, moving=image, transformlist=transforms, whichtoinvert=invert)
+
+
+def _sharpen_scalar_image(image: ants.ANTsImage, blending_weight: float) -> ants.ANTsImage:
+    """``w * image + (1 - w) * Sharpen(image)`` for a scalar image."""
+    return image * blending_weight + ants.iMath(image, "Sharpen") * (1.0 - blending_weight)
+
+
 def _sharpen_vector_image(image: ants.ANTsImage, blending_weight: float) -> ants.ANTsImage:
     """``w * image + (1 - w) * Sharpen(image)`` applied per component (``ants.iMath`` Sharpen is scalar only)."""
     array = np.asarray(image.numpy(), dtype=np.float32)
@@ -299,6 +350,8 @@ def build_template(
     type_of_transform: str = "SyN",
     convergence_threshold: float = 0.0,
     affine_every_iteration: bool = False,
+    extra_contrasts: Optional[Sequence[Sequence[ants.ANTsImage]]] = None,
+    extra_contrast_weights: Optional[Sequence[float]] = None,
     verbose: bool = False,
     **kwargs: Any,
 ) -> Dict[str, Any]:
@@ -337,6 +390,18 @@ def build_template(
         Stop early when the mean warp's RMS size falls below this (``0`` = never).
     affine_every_iteration : bool, default False
         ``True`` runs the full ``type_of_transform`` (affine included) every iteration.
+    extra_contrasts : sequence of sequences of ants.ANTsImage, optional
+        Further contrasts of the same subjects (``extra_contrasts[c][k]``
+        belongs to ``image_list[k]``; scalar images such as T1-weighted
+        volumes). Each is resampled onto its primary image's grid, gets its
+        own template (initial average, the same shape update, scalar
+        sharpening) and is registered together with the primary images
+        through ``syn_registration``'s ``extra_contrasts``: a multi-contrast
+        template as built by ``population_template`` with several input
+        directories or ``antsMultivariateTemplateConstruction2.sh -k``.
+    extra_contrast_weights : sequence of float, optional
+        Weight of each extra contrast in the similarity (default 1 each; see
+        ``syn_registration``).
     verbose : bool, default False
     **kwargs
         Forwarded to ``syn_registration`` (``regularizer``, ``syn_metric``,
@@ -356,7 +421,9 @@ def build_template(
     -------
     dict
         ``template``; ``warped_images`` / ``fwdtransforms`` / ``invtransforms``
-        (per image, last iteration); ``convergence`` (mean absolute template
+        (per image, last iteration); ``extra_templates`` and
+        ``warped_extra_images`` (per extra contrast; the latter per image,
+        last iteration); ``convergence`` (mean absolute template
         change per iteration); ``shape_residuals`` (per iteration: ``l2_norm``,
         ``membrane_energy``, ``bending_energy`` of the mean warp);
         ``n_iterations``; ``weights``; ``work_dir``; ``elapsed_sec``.
@@ -400,6 +467,11 @@ def build_template(
     # template; SH templates and non-linear interpolators go through torch.
     torch_template_update = fod_tools is not None or interpolator != "linear"
 
+    extras = _prepare_template_extras(image_list, extra_contrasts, interpolator, torch_device)
+    n_extra = len(extras)
+    if extra_contrast_weights is not None and len(extra_contrast_weights) != n_extra:
+        raise ValueError(f"extra_contrast_weights must have one entry per extra contrast ({n_extra}), got {len(extra_contrast_weights)}")
+
     work_dir = tempfile.mkdtemp(prefix="antstorch_tmpl_") if output_dir is None else output_dir
     os.makedirs(work_dir, exist_ok=True)
 
@@ -409,12 +481,14 @@ def build_template(
         return os.path.join(d, "out")
 
     xavg = _initial_template(image_list, weights, interpolator) if initial_template is None else initial_template.clone()
+    xavg_extras = [_initial_template(contrast, weights, interpolator) for contrast in extras]
 
     shape_residuals: List[Dict[str, float]] = []
     convergence: List[float] = []
     last_warped: List[Optional[ants.ANTsImage]] = [None] * n
     last_fwd: List[List[str]] = [[] for _ in range(n)]
     last_inv: List[List[str]] = [[] for _ in range(n)]
+    last_warped_extras: List[List[Optional[ants.ANTsImage]]] = [[None] * n for _ in range(n_extra)]
     # Each image's affine from its last full registration, as an ITK-order
     # (matrix, translation) pair, fed back as ``initial_affine`` to 'SyNOnly'.
     image_affine: List[Optional[Tuple[Any, Any]]] = [None] * n
@@ -427,6 +501,7 @@ def build_template(
         affine_files: List[str] = []
         wavg: Optional[ants.ANTsImage] = None
         xavg_new: Optional[ants.ANTsImage] = None
+        xavg_extras_new: List[Optional[ants.ANTsImage]] = [None] * n_extra
         has_field = False
 
         for k in range(n):
@@ -435,6 +510,9 @@ def build_template(
             reg_kw = dict(kwargs)
             if iter_tot == "SyNOnly" and image_affine[k] is not None:
                 reg_kw["initial_affine"] = image_affine[k]
+            if n_extra:
+                reg_kw["extra_contrasts"] = [(xavg_extras[c], extras[c][k]) for c in range(n_extra)]
+                reg_kw["extra_contrast_weights"] = extra_contrast_weights
             w1 = syn_registration(
                 xavg,
                 image_list[k],
@@ -461,6 +539,10 @@ def build_template(
             weight = float(weights[k])
             warped = w1["warpedmovout"] * weight
             xavg_new = warped if xavg_new is None else xavg_new + warped
+            for c in range(n_extra):
+                last_warped_extras[c][k] = w1["warpedmovout_extras"][c]
+                warped_extra = w1["warpedmovout_extras"][c] * weight
+                xavg_extras_new[c] = warped_extra if xavg_extras_new[c] is None else xavg_extras_new[c] + warped_extra
             if has_field:
                 field = ants.image_read(w1["fwdtransforms"][0]) * weight
                 wavg = field if wavg is None else wavg + field
@@ -497,35 +579,27 @@ def build_template(
         # antsApplyTransforms only needs the reference geometry from ``fixed``; a scalar
         # channel keeps it away from the multi-component template.
         reference = xavg_new if fod_tools is None else fod_tools.scalar_channel(xavg_new)
+        scaled: Optional[ants.ANTsImage] = None
+        warp_fn: Optional[str] = None
         if has_field and wavg is not None:
             scaled = wavg * ((-1.0) * gradient_step)
             if affine_fn is not None:
                 scaled = _apply_affine_to_vectors(reference, scaled, affine_fn, invert=True)
             warp_fn = os.path.join(work_dir, f"avgWarp_{it}.nii.gz")
             ants.image_write(scaled, warp_fn)
-            if torch_template_update:
-                xavg = _warp_sh_template(xavg_new, scaled, affine_fn, fod_tools, interpolator, torch_device)
-            else:
-                transforms = [warp_fn] + ([affine_fn] if affine_fn is not None else [])
-                invert = [0] + ([1] if affine_fn is not None else [])
-                xavg = ants.apply_transforms(
-                    fixed=xavg_new, moving=xavg_new, transformlist=transforms, whichtoinvert=invert
-                )
-        elif affine_fn is not None:
-            if torch_template_update:
-                xavg = _warp_sh_template(xavg_new, None, affine_fn, fod_tools, interpolator, torch_device)
-            else:
-                xavg = ants.apply_transforms(
-                    fixed=xavg_new, moving=xavg_new, transformlist=[affine_fn], whichtoinvert=[1]
-                )
-        else:
-            xavg = xavg_new
+        # The extra-contrast templates follow the primary template through the same update.
+        xavg = _apply_shape_update(xavg_new, fod_tools, scaled, warp_fn, affine_fn, torch_template_update, interpolator, torch_device)
+        xavg_extras = [
+            _apply_shape_update(image, None, scaled, warp_fn, affine_fn, torch_template_update, interpolator, torch_device)
+            for image in xavg_extras_new
+        ]
 
         if blending_weight < 1.0:
             if fod_tools is not None:
                 xavg = _sharpen_vector_image(xavg, blending_weight)
             else:
-                xavg = xavg * blending_weight + ants.iMath(xavg, "Sharpen") * (1.0 - blending_weight)
+                xavg = _sharpen_scalar_image(xavg, blending_weight)
+            xavg_extras = [_sharpen_scalar_image(image, blending_weight) for image in xavg_extras]
 
         change = _template_change(xavg_pre, xavg)
         convergence.append(change)
@@ -540,6 +614,8 @@ def build_template(
     return {
         "template": xavg,
         "warped_images": last_warped,
+        "extra_templates": xavg_extras,
+        "warped_extra_images": last_warped_extras,
         "fwdtransforms": last_fwd,
         "invtransforms": last_inv,
         "convergence": convergence,

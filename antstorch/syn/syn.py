@@ -414,6 +414,95 @@ def _compose_fixed_grid(first: Tensor, second: Tensor, X_phys: Tensor, meta_t: D
 _OUTPUT_INTERPOLATORS = ("linear", "cubic", "bspline", "nearest")
 
 
+def _same_grid(image, reference) -> bool:
+    """Whether two ``ants.ANTsImage`` share shape, spacing, origin and direction."""
+    return (
+        tuple(image.shape) == tuple(reference.shape)
+        and np.allclose(image.spacing, reference.spacing)
+        and np.allclose(image.origin, reference.origin)
+        and np.allclose(np.asarray(image.direction), np.asarray(reference.direction))
+    )
+
+
+def _resample_scalar_onto(image, reference):
+    """``image`` on ``reference``'s grid (linear interpolation); ``image`` itself when it is already there."""
+    if _same_grid(image, reference):
+        return image
+    target = ants.split_channels(reference)[0] if reference.components > 1 else reference
+    return ants.resample_image_to_target(image, target, interp_type="linear")
+
+
+def _prepare_extra_contrasts(fixed, moving, extra_contrasts, extra_contrast_weights):
+    """Validate ``extra_contrasts``/``extra_contrast_weights`` and put every extra image on its primary image's grid.
+
+    Returns ``(pairs, weights)``: a list of ``(fixed_extra, moving_extra)`` scalar images living on
+    ``fixed``'s and ``moving``'s grids, and one non-negative weight per pair (default 1).
+    """
+    pairs = []
+    for k, pair in enumerate(extra_contrasts or ()):
+        if len(pair) != 2:
+            raise ValueError(f"extra_contrasts[{k}] must be a (fixed, moving) pair of images, got {len(pair)} items")
+        fixed_extra, moving_extra = pair
+        for image, role in ((fixed_extra, "fixed"), (moving_extra, "moving")):
+            if image.components != 1:
+                raise ValueError(
+                    f"extra_contrasts[{k}] ({role}): extra contrasts must be scalar images, got {image.components} components"
+                )
+            if image.dimension != fixed.dimension:
+                raise ValueError(f"extra_contrasts[{k}] ({role}) is {image.dimension}-D, the primary images are {fixed.dimension}-D")
+        pairs.append((_resample_scalar_onto(fixed_extra, fixed), _resample_scalar_onto(moving_extra, moving)))
+    if extra_contrast_weights is None:
+        weights = (1.0,) * len(pairs)
+    else:
+        weights = tuple(float(w) for w in extra_contrast_weights)
+        if len(weights) != len(pairs):
+            raise ValueError(
+                f"extra_contrast_weights must have one entry per extra contrast ({len(pairs)}), got {len(weights)}"
+            )
+        if any(w < 0.0 for w in weights):
+            raise ValueError("extra_contrast_weights must be non-negative")
+    return pairs, weights
+
+
+def _extra_contrast_tensors(pairs, weights, scale_from_fixed: bool, device, dtype):
+    """Channel tensors ``(1, n_extra, *spatial)`` of the fixed and moving extra contrasts, normalized and weighted.
+
+    With ``scale_from_fixed`` (the FOD convention) both images of a contrast are scaled by one
+    factor, ``1 / the 99th percentile of the fixed image's positive values``; otherwise each
+    image gets :func:`ants_image_to_tensor`'s per-image percentile normalization. A weight ``w``
+    multiplies the channel by ``sqrt(w)``, so the contrast's window moments (``'lncc_joint'``) or
+    squared differences (``'mse'``) enter the similarity scaled by ``w``. Returns ``(None, None)``
+    without extra contrasts.
+    """
+    if not pairs:
+        return None, None
+    fixed_channels, moving_channels = [], []
+    for (fixed_extra, moving_extra), weight in zip(pairs, weights):
+        if scale_from_fixed:
+            fixed_t = ants_image_to_tensor(fixed_extra, device, dtype, normalize=False)
+            moving_t = ants_image_to_tensor(moving_extra, device, dtype, normalize=False)
+            scale = FODRegistration.intensity_scale(fixed_t)
+            fixed_t, moving_t = fixed_t * scale, moving_t * scale
+        else:
+            fixed_t = ants_image_to_tensor(fixed_extra, device, dtype)
+            moving_t = ants_image_to_tensor(moving_extra, device, dtype)
+        root = math.sqrt(weight)
+        fixed_channels.append(fixed_t * root)
+        moving_channels.append(moving_t * root)
+    return torch.cat(fixed_channels, dim=1), torch.cat(moving_channels, dim=1)
+
+
+def _warp_extra_contrasts(pairs, coords, select, interpolator, padding_mode, device, dtype):
+    """The extra images chosen by ``select`` (``0`` fixed, ``1`` moving) sampled at ``coords``, as scalar images on the fixed grid."""
+    return [
+        tensor_to_ants_image(
+            _sample_output(ants_image_to_tensor(pair[select], device, dtype, normalize=False), coords, interpolator, padding_mode),
+            pair[0],
+        )
+        for pair in pairs
+    ]
+
+
 def _sample_output(image: Tensor, coords: Tensor, interpolator: str, padding_mode: str) -> Tensor:
     """Sample ``image`` at normalized ``coords`` for the warped outputs (``output_interpolator``)."""
     if interpolator == "linear":
@@ -932,6 +1021,8 @@ def syn_registration(
     fod_directions=60,
     fod_modulate: bool = False,
     output_interpolator: Optional[str] = None,
+    extra_contrasts: Optional[Sequence[Sequence[ants.ANTsImage]]] = None,
+    extra_contrast_weights: Optional[Sequence[float]] = None,
     verbose: bool = False,
 ) -> Dict[str, object]:
     """Register ``moving`` onto ``fixed`` with (optionally affine-initialized) greedy symmetric SyN.
@@ -1175,6 +1266,24 @@ def syn_registration(
     B-spline, see :func:`antstorch.syn.core.grid_sample_bspline_torch`) or
     ``'nearest'``.
 
+    **Extra contrasts (multi-contrast registration).** ``extra_contrasts``
+    adds further ``(fixed_k, moving_k)`` pairs of scalar images (a
+    T1-weighted volume next to an FOD image, say) that are warped by the
+    same transform and enter the similarity together with
+    ``fixed``/``moving``, like ``antsRegistration``'s multivariate extras or
+    ``mrregister``'s additional contrasts. Each extra image is resampled
+    linearly onto its primary image's grid when it lives on another one,
+    normalized like the primary image (``fod=True``: both images of a
+    contrast by one factor, the 99th percentile of the fixed one; otherwise
+    the per-image percentile normalization) and appended as a channel; with
+    ``fod=True`` it is registered at every pyramid level alongside the
+    truncated SH series and is never reoriented. ``extra_contrast_weights``
+    (one per contrast, default 1) scale a contrast's contribution to the
+    similarity: its window moments for ``'lncc_joint'``, its squared
+    differences for ``'mse'``. The affine stage uses the primary images
+    alone. The warped extra images come back as ``warpedmovout_extras`` and
+    ``warpedfixout_extras`` (lists in the order given, on the fixed grid).
+
     Returns
     -------
     dict
@@ -1381,6 +1490,9 @@ def syn_registration(
             resolved_device = torch.device("cpu")
     resolved_outprefix = outprefix if outprefix else default_outprefix()
 
+    # --- Extra contrasts (multi-contrast registration) -----------------------
+    extra_pairs, extra_weights = _prepare_extra_contrasts(fixed, moving, extra_contrasts, extra_contrast_weights)
+
     # --- FOD (spherical harmonic) inputs ----------------------------------
     fod_registration = None
     affine_fixed, affine_moving = fixed, moving
@@ -1397,7 +1509,7 @@ def syn_registration(
             raise ValueError(f"fod_lmax must have one entry per level ({len(levels)}), got {len(fod_lmax)}")
         fod_registration = FODRegistration(
             image_lmax, fod_lmax, directions=fod_directions, modulate_output=fod_modulate,
-            device=resolved_device, dtype=dtype,
+            extra_channels=len(extra_pairs), device=resolved_device, dtype=dtype,
         )
         if _fod_default_metric:
             syn_metric = "lncc_joint"
@@ -1453,9 +1565,10 @@ def syn_registration(
         # ants.apply_transforms()'s whichtoinvert), not an in-memory inverse
         # field -- so no separate inverse displacement is computed.
         fwd_field_xyz = affine_displacement_field(matrix_xyz, translation_xyz, fixed_domain, fixed_tensor)
-        warpedmovout_tensor = _sample_output(
-            moving_tensor, displacement_to_sampling_grid(fwd_field_xyz, fixed_domain, moving_domain),
-            output_interpolator, padding_mode,
+        sampling_grid = displacement_to_sampling_grid(fwd_field_xyz, fixed_domain, moving_domain)
+        warpedmovout_tensor = _sample_output(moving_tensor, sampling_grid, output_interpolator, padding_mode)
+        warpedmovout_extras = _warp_extra_contrasts(
+            extra_pairs, sampling_grid, 1, output_interpolator, padding_mode, resolved_device, dtype
         )
         if fod_registration is not None:
             warpedmovout_tensor = fod_registration.reorient_affine(warpedmovout_tensor, matrix_xyz)
@@ -1471,6 +1584,7 @@ def syn_registration(
         )
         return {
             "warpedmovout": warpedmovout,
+            "warpedmovout_extras": warpedmovout_extras,
             "fwdtransforms": fwdtransforms,
             "invtransforms": invtransforms,
             "jacobian": None,
@@ -1483,6 +1597,8 @@ def syn_registration(
             "provenance": {
                 "type_of_transform": type_of_transform,
                 "affine_transform_type": type_of_transform,
+                "extra_contrasts": len(extra_pairs),
+                "extra_contrast_weights": tuple(extra_weights),
                 "device": str(resolved_device),
                 "outprefix": resolved_outprefix,
             },
@@ -1506,6 +1622,14 @@ def syn_registration(
     else:
         I_full = ants_image_to_tensor(fixed, resolved_device, dtype)
         J_full = ants_image_to_tensor(moving, resolved_device, dtype)
+    I_extra, J_extra = _extra_contrast_tensors(
+        extra_pairs, extra_weights, fod_registration is not None, resolved_device, dtype
+    )
+    if I_extra is not None:
+        # Extra contrasts ride along as trailing channels: warped by the same maps, part of the
+        # same similarity (FODRegistration.channels keeps them at every lmax level).
+        I_full = torch.cat([I_full, I_extra], dim=1)
+        J_full = torch.cat([J_full, J_extra], dim=1)
 
     # Resolve any spline-distance parameter into the base-level mesh size it
     # replaces, once, against fixed's FULL native-resolution domain -- matching
@@ -1678,28 +1802,32 @@ def syn_registration(
     )
     total_inverse = _compose_fixed_grid(affine_inverse_displacement, syn_inverse, X_phys_full, fixed_meta_t_full)
 
+    forward_coords = physical_to_normalized_torch_cached(
+        X_phys_full + total_forward,
+        moving_meta_t_full["shape_t"], moving_meta_t_full["spacing_t"],
+        moving_meta_t_full["origin_t"], moving_meta_t_full["direction_t"],
+    )
+    inverse_coords = physical_to_normalized_torch_cached(
+        X_phys_full + total_inverse,
+        fixed_meta_t_full["shape_t"], fixed_meta_t_full["spacing_t"],
+        fixed_meta_t_full["origin_t"], fixed_meta_t_full["direction_t"],
+    )
     warpedmovout = _sample_output(
-        ants_image_to_tensor(moving, resolved_device, dtype, normalize=False),
-        physical_to_normalized_torch_cached(
-            X_phys_full + total_forward,
-            moving_meta_t_full["shape_t"], moving_meta_t_full["spacing_t"],
-            moving_meta_t_full["origin_t"], moving_meta_t_full["direction_t"],
-        ),
-        output_interpolator, padding_mode,
+        ants_image_to_tensor(moving, resolved_device, dtype, normalize=False), forward_coords, output_interpolator, padding_mode
     )
     warpedfixout = _sample_output(
-        ants_image_to_tensor(fixed, resolved_device, dtype, normalize=False),
-        physical_to_normalized_torch_cached(
-            X_phys_full + total_inverse,
-            fixed_meta_t_full["shape_t"], fixed_meta_t_full["spacing_t"],
-            fixed_meta_t_full["origin_t"], fixed_meta_t_full["direction_t"],
-        ),
-        output_interpolator, padding_mode,
+        ants_image_to_tensor(fixed, resolved_device, dtype, normalize=False), inverse_coords, output_interpolator, padding_mode
     )
     if fod_registration is not None:
         # Reorient the warped FODs by the Jacobians of the total pull-back maps.
         warpedmovout = fod_registration.reorient_warped(warpedmovout, total_forward, fixed_meta_full)
         warpedfixout = fod_registration.reorient_warped(warpedfixout, total_inverse, fixed_meta_full)
+    warpedmovout_extras = _warp_extra_contrasts(
+        extra_pairs, forward_coords, 1, output_interpolator, padding_mode, resolved_device, dtype
+    )
+    warpedfixout_extras = _warp_extra_contrasts(
+        extra_pairs, inverse_coords, 0, output_interpolator, padding_mode, resolved_device, dtype
+    )
 
     # total_forward is already a genuine physical-mm displacement field
     # (not a normalized-grid one), so the lower-level, spacing-aware
@@ -1734,6 +1862,8 @@ def syn_registration(
     result = {
         "warpedmovout": tensor_to_ants_image(warpedmovout, fixed),
         "warpedfixout": tensor_to_ants_image(warpedfixout, fixed),
+        "warpedmovout_extras": warpedmovout_extras,
+        "warpedfixout_extras": warpedfixout_extras,
         "fwdtransforms": fwdtransforms,
         "invtransforms": invtransforms,
         "jacobian": tensor_to_ants_image(jacobian, fixed),
@@ -1774,6 +1904,8 @@ def syn_registration(
             "fod_directions": fod_directions if fod else None,
             "fod_modulate": fod_modulate if fod else None,
             "output_interpolator": output_interpolator,
+            "extra_contrasts": len(extra_pairs),
+            "extra_contrast_weights": tuple(extra_weights),
             "affine_fit": affine_result is not None,
             "device": str(resolved_device),
             "outprefix": resolved_outprefix,

@@ -7,6 +7,9 @@ coefficient, moves the template by a fraction of the mean warp (with
 reorientation) and sharpens it per coefficient. Warped images and the template
 are resampled with an interpolating cubic kernel by default, like MRtrix3's
 ``mrtransform``, so the template keeps the angular contrast of its inputs.
+Extra contrasts (``--extra``, e.g. T1-weighted images of the same subjects)
+are registered together with the FODs and get a template of their own, like
+``population_template`` with several input directories.
 """
 import argparse
 from pathlib import Path
@@ -26,22 +29,35 @@ def main():
     parser.add_argument("--reg-iterations", type=int, nargs="+", default=(50, 50, 50))
     parser.add_argument("--output-interpolator", default="cubic", choices=("linear", "cubic", "bspline", "nearest"),
                         help="interpolation of the warped images and of the template in the shape update")
+    parser.add_argument("--extra", action="append", nargs="+", metavar="IMAGE", default=[],
+                        help="an extra contrast (scalar images, one per FOD image in the same order); repeat for several contrasts")
+    parser.add_argument("--extra-weights", type=float, nargs="+", default=None,
+                        help="weight of each extra contrast in the similarity (default 1)")
     args = parser.parse_args()
+    import ants
     from antstorch.syn import build_template
     from antstorch.syn.fod import fod_image_read, fod_image_write
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     images = [fod_image_read(path) for path in args.images]
+    for contrast in args.extra:
+        if len(contrast) != len(images):
+            parser.error(f"--extra needs one image per FOD image ({len(images)}), got {len(contrast)}")
+    extras = [[ants.image_read(path) for path in contrast] for contrast in args.extra]
     result = build_template(
         image_list=images, iterations=args.iterations, gradient_step=args.gradient_step,
         blending_weight=args.blending_weight, output_dir=str(args.output_dir / "work"), type_of_transform="SyN",
         fod=True, syn_metric=args.metric, levels=(4, 2, 1), reg_iterations=tuple(args.reg_iterations),
         flow_sigma=args.flow_sigma, total_sigma=args.total_sigma, output_interpolator=args.output_interpolator,
-        device=args.device, verbose=True,
+        extra_contrasts=extras or None, extra_contrast_weights=args.extra_weights, device=args.device, verbose=True,
     )
     fod_image_write(result["template"], str(args.output_dir / "template.nii.gz"))
     for path, warped in zip(args.images, result["warped_images"]):
         fod_image_write(warped, str(args.output_dir / f"warped_{Path(path).name}"))
+    for c, (template, warped_images) in enumerate(zip(result["extra_templates"], result["warped_extra_images"]), start=1):
+        ants.image_write(template, str(args.output_dir / f"template_extra{c}.nii.gz"))
+        for path, warped in zip(args.extra[c - 1], warped_images):
+            ants.image_write(warped, str(args.output_dir / f"warped_extra{c}_{Path(path).name}"))
     print("Mean warp RMS per iteration (mm):", [round(r["l2_norm"], 4) for r in result["shape_residuals"]])
     print("Template mean absolute change per iteration:", [round(c, 6) for c in result["convergence"]])
 

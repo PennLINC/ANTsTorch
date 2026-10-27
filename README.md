@@ -33,7 +33,7 @@ It complements [ANTsPyNet](https://github.com/ANTsX/ANTsPyNet/) and [ANTsRNet](h
 | **Deep learning** | 2-D and 3-D U-Nets, ResNets, dense networks, deep back-projection networks, and task-specific architectures | [U-Net example](examples/unet_2d.py) |
 | **Pretrained applications** | Brain extraction, tissue segmentation, anatomical labeling, lung imaging, super-resolution, and more | [Application catalog](#pretrained-applications) |
 | **Image processing** | Preprocessing, augmentation, and tensor-native N4 bias field correction | [N4 example](examples/n4_synthetic.py) |
-| **Registration** | SyN, affine, and B-spline stationary velocity field registration; multi-component images and diffusion MRI fiber orientation distributions (FODs) with spherical harmonic reorientation | [SyN tutorial](docs/antsx_tutorial_syn.md) · [B-spline tutorial](docs/antsx_tutorial_bspline_flows.md) · [FOD example](examples/fod_registration.py) |
+| **Registration** | SyN, affine, and B-spline stationary velocity field registration; multi-component and multi-contrast images, and diffusion MRI fiber orientation distributions (FODs) with spherical harmonic reorientation | [SyN tutorial](docs/antsx_tutorial_syn.md) · [B-spline tutorial](docs/antsx_tutorial_bspline_flows.md) · [FOD example](examples/fod_registration.py) |
 | **Cortical thickness** | Segmentation-driven workflows and a tensor implementation of DiReCT | [Implementation guide](antstorch/direct/README.md) |
 | **Normalizing flows** | Flow architectures and LAMNR hybrid training workflows | [Training guide](docs/lamnr_hybrid_trainer.md) |
 

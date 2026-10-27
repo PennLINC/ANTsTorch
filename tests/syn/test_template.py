@@ -165,6 +165,8 @@ class TestBuildTemplateSyN:
         assert set(out) == {
             "template",
             "warped_images",
+            "extra_templates",
+            "warped_extra_images",
             "fwdtransforms",
             "invtransforms",
             "convergence",

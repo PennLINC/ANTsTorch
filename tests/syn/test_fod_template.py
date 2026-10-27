@@ -195,3 +195,52 @@ def test_build_template_fod_rejects_mismatched_components(tmp_path):
     images = [_fod_image((8, 8, 8), (4, 4, 4), lmax=4), _fod_image((8, 8, 8), (4, 4, 4), lmax=2)]
     with pytest.raises(ValueError, match="same number"):
         build_template(image_list=images, iterations=1, output_dir=str(tmp_path), fod=True, levels=(1,), reg_iterations=(1,), device="cpu")
+
+
+def _scalar_blob(shape, center, sigma=2.5, spacing=(2.0, 2.0, 2.0), origin=(-20.0, -18.0, 5.0)):
+    array = np.ascontiguousarray(np.transpose(_blob(shape, center, sigma), (2, 1, 0)).astype(np.float32))
+    return ants.from_numpy(array, origin=origin, spacing=spacing, direction=_DIRECTION)
+
+
+def test_build_template_with_an_extra_contrast(tmp_path):
+    centers = ((6, 6, 7), (5, 7, 8), (7, 6, 6))
+    images = [_fod_image((12, 13, 14), c) for c in centers]
+    extras = [_scalar_blob((12, 13, 14), c) * 3.0 for c in centers]
+    common = dict(
+        gradient_step=0.2, output_dir=str(tmp_path), type_of_transform="SyN", fod=True, levels=(2, 1), reg_iterations=(3, 2),
+        affine_iterations=(10, 10, 10), affine_multi_start=False, device="cpu",
+    )
+    result = build_template(
+        image_list=images, extra_contrasts=[extras], extra_contrast_weights=[0.5], iterations=2, blending_weight=0.75, **common
+    )
+    assert result["template"].components == images[0].components
+    assert len(result["extra_templates"]) == 1
+    extra_template = result["extra_templates"][0]
+    assert extra_template.components == 1 and tuple(extra_template.shape) == tuple(images[0].shape)
+    assert np.allclose(extra_template.spacing, images[0].spacing) and np.isfinite(extra_template.numpy()).all()
+    # The extra template is an average of the warped extras: its peak sits between the inputs' peaks.
+    assert 0.5 * 3.0 < extra_template.numpy().max() <= 3.0 * 1.05
+    assert len(result["warped_extra_images"]) == 1 and len(result["warped_extra_images"][0]) == 3
+    assert all(w.components == 1 and tuple(w.shape) == tuple(images[0].shape) for w in result["warped_extra_images"][0])
+    assert result["n_iterations"] == 2
+
+    # Extras on a finer grid are resampled onto the primary grid first.
+    fine = [_scalar_blob((24, 26, 28), tuple(2 * v for v in c), sigma=5.0, spacing=(1.0, 1.0, 1.0)) for c in centers]
+    fine_result = build_template(image_list=images, extra_contrasts=[fine], iterations=1, blending_weight=1.0, **common)
+    assert tuple(fine_result["extra_templates"][0].shape) == tuple(images[0].shape)
+    assert np.allclose(fine_result["extra_templates"][0].spacing, images[0].spacing)
+
+    with pytest.raises(ValueError, match="extra_contrasts\\[0\\]"):
+        build_template(image_list=images, extra_contrasts=[extras[:2]], iterations=1, **common)
+    with pytest.raises(ValueError, match="extra_contrast_weights"):
+        build_template(image_list=images, extra_contrasts=[extras], extra_contrast_weights=[1.0, 1.0], iterations=1, **common)
+    with pytest.raises(ValueError, match="scalar"):
+        build_template(image_list=images, extra_contrasts=[images], iterations=1, **common)
+
+
+def test_build_template_without_extra_contrasts_returns_empty_extra_lists(tmp_path):
+    images = [ants.split_channels(_fod_image((10, 10, 10), c))[0] for c in ((5, 5, 5), (4, 5, 6))]
+    result = build_template(
+        image_list=images, iterations=1, output_dir=str(tmp_path), type_of_transform="SyNOnly", levels=(1,), reg_iterations=(1,), device="cpu"
+    )
+    assert result["extra_templates"] == [] and result["warped_extra_images"] == []

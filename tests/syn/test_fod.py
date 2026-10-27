@@ -234,3 +234,99 @@ def test_output_interpolator_default_and_cubic_outputs():
     assert np.isfinite(cubic["warpedmovout"].numpy()).all() and difference.max() > 1e-4
     # the same warp drives both outputs, so they agree where the image is smooth
     assert difference.mean() < 0.1 * np.abs(linear["warpedmovout"].numpy()).mean()
+
+
+# --- extra contrasts (multi-contrast registration) ---------------------------
+
+
+def _scalar_image(shape, center, sigma=2.5, spacing=(2.0, 2.0, 2.0), origin=(-20.0, -18.0, 5.0)):
+    """A scalar Gaussian blob (channel-last ``(x, y, z)`` ANTs image) on the same frame as :func:`_fod_image`."""
+    array = np.ascontiguousarray(np.transpose(_blob(shape, center, sigma), (2, 1, 0)).astype(np.float32))
+    return ants.from_numpy(array, origin=origin, spacing=spacing, direction=_DIRECTION)
+
+
+def test_extra_contrast_validation():
+    fixed = _fod_image((10, 10, 10), (5, 5, 5))
+    moving = _fod_image((10, 10, 10), (4, 5, 6))
+    t1_fixed = _scalar_image((10, 10, 10), (5, 5, 5))
+    t1_moving = _scalar_image((10, 10, 10), (4, 5, 6))
+    kw = dict(type_of_transform="SyNOnly", fod=True, levels=(1,), reg_iterations=(1,), device="cpu")
+    with pytest.raises(ValueError, match="extra_contrast_weights"):
+        syn_registration(fixed, moving, extra_contrasts=[(t1_fixed, t1_moving)], extra_contrast_weights=[1.0, 2.0], **kw)
+    with pytest.raises(ValueError, match="non-negative"):
+        syn_registration(fixed, moving, extra_contrasts=[(t1_fixed, t1_moving)], extra_contrast_weights=[-1.0], **kw)
+    with pytest.raises(ValueError, match="scalar"):
+        syn_registration(fixed, moving, extra_contrasts=[(fixed, moving)], **kw)
+    with pytest.raises(ValueError, match="pair"):
+        syn_registration(fixed, moving, extra_contrasts=[(t1_fixed,)], **kw)
+    with pytest.raises(ValueError, match="extra_channels"):
+        FODRegistration(4, (0, 2), extra_channels=-1)
+
+
+def test_fod_registration_channels_keep_the_extra_channels_at_every_lmax():
+    tools = FODRegistration(4, (0, 2, 4), extra_channels=2)
+    image = torch.arange(17.0).view(1, 17, 1, 1, 1)  # 15 SH coefficients (lmax 4) + 2 extras
+    for lmax, n in ((0, 1), (2, 6), (4, 15)):
+        selected = tools.channels(image, lmax)
+        assert selected.shape[1] == n + 2
+        assert torch.equal(selected[:, :n], image[:, :n]) and torch.equal(selected[:, n:], image[:, 15:])
+        sh_part, extras = tools.split(selected, lmax)
+        assert sh_part.shape[1] == n and extras.shape[1] == 2
+    assert FODRegistration(4, (0,)).channels(image[:, :15], 2).shape[1] == 6
+
+
+def test_extra_contrast_drives_the_registration_where_the_fods_carry_no_information():
+    shape = (14, 15, 16)
+    fixed = _fod_image(shape, (7, 7, 8))
+    moving = fixed.clone()  # identical FODs: nothing for the SH channels to move
+    t1_fixed = _scalar_image(shape, (7, 7, 8))
+    t1_moving = _scalar_image(shape, (6, 8, 9))
+    kw = dict(type_of_transform="SyNOnly", fod=True, syn_metric="lncc_joint", levels=(2, 1), reg_iterations=(8, 6), fod_lmax=(2, 4), device="cpu")
+    plain = syn_registration(fixed, moving, **kw)
+    assert np.abs(ants.image_read(plain["fwdtransforms"][0]).numpy()).max() < 1e-4
+    assert plain["warpedmovout_extras"] == [] and plain["warpedfixout_extras"] == []
+    result = syn_registration(fixed, moving, extra_contrasts=[(t1_fixed, t1_moving)], **kw)
+    warped_t1 = result["warpedmovout_extras"][0]
+    before = np.mean((t1_moving.numpy() - t1_fixed.numpy()) ** 2)
+    after = np.mean((warped_t1.numpy() - t1_fixed.numpy()) ** 2)
+    assert after < 0.5 * before
+    assert warped_t1.components == 1 and tuple(warped_t1.shape) == tuple(fixed.shape)
+    assert len(result["warpedfixout_extras"]) == 1 and result["warpedfixout_extras"][0].components == 1
+    assert result["warpedmovout"].components == fixed.components and np.isfinite(result["warpedmovout"].numpy()).all()
+    assert result["provenance"]["extra_contrasts"] == 1 and result["provenance"]["extra_contrast_weights"] == (1.0,)
+    assert np.abs(ants.image_read(result["fwdtransforms"][0]).numpy()).max() > 0.5
+
+
+def test_extra_contrast_with_zero_weight_reproduces_the_single_contrast_registration():
+    fixed = _fod_image((12, 12, 12), (6, 6, 6))
+    moving = _fod_image((12, 12, 12), (5, 6, 7))
+    t1_fixed = _scalar_image((12, 12, 12), (6, 6, 6))
+    t1_moving = _scalar_image((12, 12, 12), (4, 6, 8))
+    kw = dict(type_of_transform="SyNOnly", fod=True, syn_metric="mse", levels=(2, 1), reg_iterations=(4, 3), fod_lmax=(2, 4), device="cpu")
+    single = syn_registration(fixed, moving, **kw)
+    weighted = syn_registration(fixed, moving, extra_contrasts=[(t1_fixed, t1_moving)], extra_contrast_weights=[0.0], **kw)
+    np.testing.assert_allclose(
+        ants.image_read(weighted["fwdtransforms"][0]).numpy(), ants.image_read(single["fwdtransforms"][0]).numpy(), atol=1e-5
+    )
+    np.testing.assert_allclose(weighted["warpedmovout"].numpy(), single["warpedmovout"].numpy(), atol=1e-5)
+
+
+def test_extra_contrast_on_another_grid_is_resampled_for_scalar_and_linear_registrations():
+    fixed = _scalar_image((12, 12, 12), (6, 6, 6))
+    moving = _scalar_image((12, 12, 12), (5, 6, 7))
+    # The same field of view sampled at 1 mm instead of 2 mm.
+    fine_fixed = _scalar_image((24, 24, 24), (12, 12, 12), sigma=5.0, spacing=(1.0, 1.0, 1.0))
+    fine_moving = _scalar_image((24, 24, 24), (10, 12, 14), sigma=5.0, spacing=(1.0, 1.0, 1.0))
+    result = syn_registration(
+        fixed, moving, type_of_transform="SyNOnly", levels=(2, 1), reg_iterations=(3, 2),
+        extra_contrasts=[(fine_fixed, fine_moving)], extra_contrast_weights=[0.5], device="cpu",
+    )
+    out = result["warpedmovout_extras"][0]
+    assert tuple(out.shape) == tuple(fixed.shape) and np.allclose(out.spacing, fixed.spacing) and np.allclose(out.origin, fixed.origin)
+    assert result["provenance"]["extra_contrast_weights"] == (0.5,) and np.isfinite(out.numpy()).all()
+    linear = syn_registration(
+        fixed, moving, type_of_transform="Affine", affine_iterations=(3, 3, 3), affine_multi_start=False,
+        extra_contrasts=[(fine_fixed, fine_moving)], device="cpu",
+    )
+    assert len(linear["warpedmovout_extras"]) == 1 and tuple(linear["warpedmovout_extras"][0].shape) == tuple(fixed.shape)
+    assert linear["provenance"]["extra_contrasts"] == 1
