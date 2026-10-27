@@ -34,7 +34,6 @@ import ants
 import numpy as np
 import torch
 
-from .._torch_compat import grid_sample
 from ..ants_transform_io import read_affine_transform
 from .bridge import (
     ants_image_metadata,
@@ -43,24 +42,40 @@ from .bridge import (
     metadata_tensors_from_dict,
     tensor_to_ants_image,
 )
-from .core.grid import get_physical_grid_torch, physical_to_normalized_torch_cached
+from .core.grid import get_physical_grid_torch, grid_sample_nd, physical_to_normalized_torch_cached
 from .fod import FODRegistration, direction_transform, pullback_jacobian, sh_lmax_of_image
 
 __all__ = ["build_template"]
 
 _MANAGED_KWARGS = ("initial_affine", "outprefix")
+_INTERPOLATOR_MODES = {"linear": "bilinear", "nearest": "nearest", "cubic": "cubic", "bspline": "bspline"}
 
 
-def _sample_like_itk(tensor: torch.Tensor, coords: torch.Tensor, shape_t: torch.Tensor) -> torch.Tensor:
-    """Trilinear sampling with ITK's boundary semantics (what ``ants.apply_transforms`` does).
+def _resolve_interpolator(kwargs: Dict[str, Any], fod: bool) -> str:
+    """The ``output_interpolator`` ``syn_registration`` will use for these kwargs (its default depends on ``fod``)."""
+    interpolator = kwargs.get("output_interpolator")
+    if interpolator is None:
+        interpolator = "cubic" if fod else "linear"
+    if interpolator not in _INTERPOLATOR_MODES:
+        raise ValueError(f"output_interpolator must be one of {tuple(_INTERPOLATOR_MODES)}, got {interpolator!r}")
+    return interpolator
 
-    ITK's linear interpolator clamps neighbor indices to the buffer, so points
-    within half a voxel beyond the outermost voxel centers get the edge value
+
+def _sample_like_itk(
+    tensor: torch.Tensor, coords: torch.Tensor, shape_t: torch.Tensor, interpolator: str = "linear"
+) -> torch.Tensor:
+    """Sampling with ITK's (and MRtrix3's) boundary semantics (what ``ants.apply_transforms`` does).
+
+    ITK's interpolators clamp neighbor indices to the buffer, so points within
+    half a voxel beyond the outermost voxel centers get the edge value
     ("border" padding), and points further out get the default value 0.
     ``coords`` are normalized grid_sample coordinates (``(x, y, z)`` order);
-    ``shape_t`` is the torch (reversed) spatial shape.
+    ``shape_t`` is the torch (reversed) spatial shape; ``interpolator`` is one
+    of ``'linear'``, ``'cubic'`` (interpolating Catmull-Rom, MRtrix3's
+    ``cubic``), ``'bspline'`` or ``'nearest'``.
     """
-    sampled = grid_sample(tensor, coords, mode="bilinear", padding_mode="border", align_corners=True)
+    mode = _INTERPOLATOR_MODES[interpolator]
+    sampled = grid_sample_nd(tensor, coords, mode=mode, padding_mode="border", align_corners=True, interpolator=mode)
     dim = coords.shape[-1]
     inside = None
     for d in range(dim):
@@ -71,8 +86,10 @@ def _sample_like_itk(tensor: torch.Tensor, coords: torch.Tensor, shape_t: torch.
     return sampled * inside.unsqueeze(1).to(sampled.dtype)
 
 
-def _resample_vector_onto(image: ants.ANTsImage, target: ants.ANTsImage, device="cpu") -> ants.ANTsImage:
-    """Trilinear resampling of a (multi-component) image onto ``target``'s grid through the identity map.
+def _resample_vector_onto(
+    image: ants.ANTsImage, target: ants.ANTsImage, device="cpu", interpolator: str = "linear"
+) -> ants.ANTsImage:
+    """Resampling of a (multi-component) image onto ``target``'s grid through the identity map.
 
     ``ants.resample_image_to_target`` crashes on multi-component images (ANTsPy
     0.6.3), so the resampling is done in torch; no reorientation is needed for
@@ -93,7 +110,7 @@ def _resample_vector_onto(image: ants.ANTsImage, target: ants.ANTsImage, device=
     )
     mt = metadata_tensors_from_dict(source_meta, torch.device(device), torch.float32)
     coords = physical_to_normalized_torch_cached(X, mt["shape_t"], mt["spacing_t"], mt["origin_t"], mt["direction_t"])
-    resampled = _sample_like_itk(tensor, coords, mt["shape_t"])
+    resampled = _sample_like_itk(tensor, coords, mt["shape_t"], interpolator)
     return tensor_to_ants_image(resampled, target)
 
 
@@ -101,17 +118,22 @@ def _warp_sh_template(
     template: ants.ANTsImage,
     scaled_warp: Optional[ants.ANTsImage],
     affine_fn: Optional[str],
-    fod_tools: FODRegistration,
+    fod_tools: Optional[FODRegistration],
+    interpolator: str = "linear",
+    device=None,
 ) -> ants.ANTsImage:
-    """``ants.apply_transforms(fixed=template, moving=template, [warp, affine], whichtoinvert=[0, 1])`` for an SH template.
+    """``ants.apply_transforms(fixed=template, moving=template, [warp, affine], whichtoinvert=[0, 1])`` in torch.
 
     The template is sampled at ``phi(x) = A^-1 ((x + w(x)) - t)`` (the warp
     first, then the inverted average affine, ANTs' order for the transform
-    list) and every FOD is reoriented by ``(d phi / d x)^-1`` with the apodized
-    PSF method, exactly as the warped outputs of
-    :func:`antstorch.syn.syn_registration` are.
+    list) with ``interpolator`` (see :func:`_sample_like_itk`). With
+    ``fod_tools`` every FOD is also reoriented by ``(d phi / d x)^-1`` with the
+    apodized PSF method, exactly as the warped outputs of
+    :func:`antstorch.syn.syn_registration` are; ``None`` samples a scalar (or
+    other non-SH) template without reorientation.
     """
-    device = fod_tools.device if fod_tools.device is not None else "cpu"
+    if device is None:
+        device = fod_tools.device if fod_tools is not None and fod_tools.device is not None else "cpu"
     meta = ants_image_metadata(template)
     tensor = ants_image_to_tensor(template, device, torch.float32, normalize=False)  # (1, C, z, y, x)
     X = get_physical_grid_torch(meta["torch_shape"], meta["spacing"], meta["origin"], meta["direction"], device=device)
@@ -133,8 +155,8 @@ def _warp_sh_template(
         points = points @ affine_zyx.transpose(0, 1) + translation_zyx.to(device)
     mt = metadata_tensors_from_dict(meta, torch.device(device), torch.float32)
     coords = physical_to_normalized_torch_cached(points, mt["shape_t"], mt["spacing_t"], mt["origin_t"], mt["direction_t"])
-    warped = _sample_like_itk(tensor, coords, mt["shape_t"])
-    reorienter = fod_tools.reorienter(fod_tools.image_lmax)
+    warped = _sample_like_itk(tensor, coords, mt["shape_t"], interpolator)
+    reorienter = fod_tools.reorienter(fod_tools.image_lmax) if fod_tools is not None else None
     if reorienter is not None:
         jacobian = pullback_jacobian(displacement, meta["spacing"], meta["direction"], affine=affine_zyx)
         warped = reorienter.reorient(
@@ -178,12 +200,14 @@ def _normalize_weights(weights: Optional[Sequence[float]], n: int) -> np.ndarray
     return w / total
 
 
-def _initial_template(image_list: List[ants.ANTsImage], weights: Sequence[float]) -> ants.ANTsImage:
+def _initial_template(
+    image_list: List[ants.ANTsImage], weights: Sequence[float], interpolator: str = "linear"
+) -> ants.ANTsImage:
     """Weighted average of ``image_list``, resampled onto the first image."""
     template = image_list[0] * 0
     for image, weight in zip(image_list, weights):
-        if image.components > 1:
-            template = template + _resample_vector_onto(image, template) * float(weight)
+        if image.components > 1 or interpolator != "linear":
+            template = template + _resample_vector_onto(image, template, interpolator=interpolator) * float(weight)
         else:
             template = template + ants.resample_image_to_target(image * float(weight), template)
     return template
@@ -322,6 +346,11 @@ def build_template(
         template of spherical harmonic FOD images: the registrations reorient
         the FODs, the shape update is applied to the SH template with
         reorientation, and sharpening is applied per coefficient.
+        ``output_interpolator`` (``'linear'``, ``'cubic'``, ``'bspline'``,
+        ``'nearest'``; default ``'cubic'`` for FODs, ``'linear'`` otherwise)
+        is used both for the warped images and for resampling the template
+        in the shape update; the interpolating cubic keeps the template as
+        sharp as its inputs, where repeated trilinear resampling blurs it.
 
     Returns
     -------
@@ -349,6 +378,10 @@ def build_template(
 
     n = len(image_list)
     weights = _normalize_weights(weights, n)
+    interpolator = _resolve_interpolator(kwargs, bool(kwargs.get("fod", False)))
+    torch_device = kwargs.get("device")
+    if torch_device is None:
+        torch_device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # FOD (spherical harmonic) inputs: the registrations handle the reorientation
     # (``fod=True`` is forwarded to syn_registration); the template-side steps
@@ -359,13 +392,13 @@ def build_template(
         if any(image.components != components for image in image_list):
             raise ValueError("all FOD images must have the same number of spherical harmonic coefficients")
         image_lmax = sh_lmax_of_image(image_list[0])
-        fod_device = kwargs.get("device")
-        if fod_device is None:
-            fod_device = "cuda" if torch.cuda.is_available() else "cpu"
         fod_tools = FODRegistration(
             image_lmax, (image_lmax,), directions=kwargs.get("fod_directions", 60),
-            modulate_output=bool(kwargs.get("fod_modulate", False)), device=fod_device, dtype=torch.float32,
+            modulate_output=bool(kwargs.get("fod_modulate", False)), device=torch_device, dtype=torch.float32,
         )
+    # The ANTs path (ants.apply_transforms) only offers linear interpolation of the
+    # template; SH templates and non-linear interpolators go through torch.
+    torch_template_update = fod_tools is not None or interpolator != "linear"
 
     work_dir = tempfile.mkdtemp(prefix="antstorch_tmpl_") if output_dir is None else output_dir
     os.makedirs(work_dir, exist_ok=True)
@@ -375,7 +408,7 @@ def build_template(
         os.makedirs(d, exist_ok=True)
         return os.path.join(d, "out")
 
-    xavg = _initial_template(image_list, weights) if initial_template is None else initial_template.clone()
+    xavg = _initial_template(image_list, weights, interpolator) if initial_template is None else initial_template.clone()
 
     shape_residuals: List[Dict[str, float]] = []
     convergence: List[float] = []
@@ -470,8 +503,8 @@ def build_template(
                 scaled = _apply_affine_to_vectors(reference, scaled, affine_fn, invert=True)
             warp_fn = os.path.join(work_dir, f"avgWarp_{it}.nii.gz")
             ants.image_write(scaled, warp_fn)
-            if fod_tools is not None:
-                xavg = _warp_sh_template(xavg_new, scaled, affine_fn, fod_tools)
+            if torch_template_update:
+                xavg = _warp_sh_template(xavg_new, scaled, affine_fn, fod_tools, interpolator, torch_device)
             else:
                 transforms = [warp_fn] + ([affine_fn] if affine_fn is not None else [])
                 invert = [0] + ([1] if affine_fn is not None else [])
@@ -479,8 +512,8 @@ def build_template(
                     fixed=xavg_new, moving=xavg_new, transformlist=transforms, whichtoinvert=invert
                 )
         elif affine_fn is not None:
-            if fod_tools is not None:
-                xavg = _warp_sh_template(xavg_new, None, affine_fn, fod_tools)
+            if torch_template_update:
+                xavg = _warp_sh_template(xavg_new, None, affine_fn, fod_tools, interpolator, torch_device)
             else:
                 xavg = ants.apply_transforms(
                     fixed=xavg_new, moving=xavg_new, transformlist=[affine_fn], whichtoinvert=[1]

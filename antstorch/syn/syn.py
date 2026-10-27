@@ -69,6 +69,7 @@ from .bridge import (
 from .._torch_compat import grid_sample, grid_sample_for_probe
 from .core.grid import (
     get_physical_grid_torch,
+    grid_sample_nd,
     physical_to_normalized_torch_cached,
     prepare_mid_images_and_gradients_torch,
 )
@@ -408,6 +409,18 @@ def _compose_fixed_grid(first: Tensor, second: Tensor, X_phys: Tensor, meta_t: D
     )
     sampled = grid_sample(second.movedim(-1, 1), coords_norm, mode="bilinear", padding_mode="border", align_corners=True)
     return first + sampled.movedim(1, -1)
+
+
+_OUTPUT_INTERPOLATORS = ("linear", "cubic", "bspline", "nearest")
+
+
+def _sample_output(image: Tensor, coords: Tensor, interpolator: str, padding_mode: str) -> Tensor:
+    """Sample ``image`` at normalized ``coords`` for the warped outputs (``output_interpolator``)."""
+    if interpolator == "linear":
+        return grid_sample(image, coords, mode="bilinear", padding_mode=padding_mode, align_corners=True)
+    if interpolator == "nearest":
+        return grid_sample(image, coords, mode="nearest", padding_mode=padding_mode, align_corners=True)
+    return grid_sample_nd(image, coords, interpolator=interpolator, padding_mode=padding_mode, align_corners=True)
 
 
 def _fit_syn_level(
@@ -918,6 +931,7 @@ def syn_registration(
     fod_lmax: Optional[Sequence[int]] = None,
     fod_directions=60,
     fod_modulate: bool = False,
+    output_interpolator: Optional[str] = None,
     verbose: bool = False,
 ) -> Dict[str, object]:
     """Register ``moving`` onto ``fixed`` with (optionally affine-initialized) greedy symmetric SyN.
@@ -1151,6 +1165,16 @@ def syn_registration(
     ``'lncc_joint'``; ``'mse'`` on the coefficients is the ``mrregister``
     choice.
 
+    ``output_interpolator`` selects how ``warpedmovout``/``warpedfixout`` are
+    sampled (the registration itself always uses linear interpolation, as
+    ANTs does): ``'linear'`` (the default for scalar images, what
+    ``ants.registration`` returns), ``'cubic'`` (interpolating Catmull-Rom
+    cubic, the default for ``fod=True`` and the kernel of MRtrix3's
+    ``mrtransform``; it keeps the FODs' angular contrast, which trilinear
+    resampling blurs by several percent), ``'bspline'`` (approximating cubic
+    B-spline, see :func:`antstorch.syn.core.grid_sample_bspline_torch`) or
+    ``'nearest'``.
+
     Returns
     -------
     dict
@@ -1256,6 +1280,12 @@ def syn_registration(
         )
     if padding_mode not in ("zeros", "border", "reflection"):
         raise ValueError("padding_mode must be 'zeros', 'border', or 'reflection'")
+    if output_interpolator is None:
+        output_interpolator = "cubic" if fod else "linear"
+    if output_interpolator not in _OUTPUT_INTERPOLATORS:
+        raise ValueError(f"output_interpolator must be one of {_OUTPUT_INTERPOLATORS}, got {output_interpolator!r}")
+    if output_interpolator in ("cubic", "bspline") and padding_mode == "reflection":
+        raise ValueError("output_interpolator 'cubic'/'bspline' supports padding_mode 'zeros' or 'border' only")
     if len(levels) != len(reg_iterations):
         raise ValueError("levels and reg_iterations must have the same length")
 
@@ -1408,7 +1438,7 @@ def syn_registration(
         # directly via initial_affine, (re)compute its dense field and
         # warped output directly from (matrix_xyz, translation_xyz) so both
         # paths return the same shape of result.
-        from antstorch.bspline_flows import ImageDomain, affine_displacement_field, warp_image
+        from antstorch.bspline_flows import ImageDomain, affine_displacement_field, displacement_to_sampling_grid
 
         fixed_meta = ants_image_metadata(fixed)
         moving_meta = ants_image_metadata(moving)
@@ -1423,8 +1453,9 @@ def syn_registration(
         # ants.apply_transforms()'s whichtoinvert), not an in-memory inverse
         # field -- so no separate inverse displacement is computed.
         fwd_field_xyz = affine_displacement_field(matrix_xyz, translation_xyz, fixed_domain, fixed_tensor)
-        warpedmovout_tensor = warp_image(
-            moving_tensor, fwd_field_xyz, fixed_domain, moving_domain, padding_mode=padding_mode
+        warpedmovout_tensor = _sample_output(
+            moving_tensor, displacement_to_sampling_grid(fwd_field_xyz, fixed_domain, moving_domain),
+            output_interpolator, padding_mode,
         )
         if fod_registration is not None:
             warpedmovout_tensor = fod_registration.reorient_affine(warpedmovout_tensor, matrix_xyz)
@@ -1647,23 +1678,23 @@ def syn_registration(
     )
     total_inverse = _compose_fixed_grid(affine_inverse_displacement, syn_inverse, X_phys_full, fixed_meta_t_full)
 
-    warpedmovout = grid_sample(
+    warpedmovout = _sample_output(
         ants_image_to_tensor(moving, resolved_device, dtype, normalize=False),
         physical_to_normalized_torch_cached(
             X_phys_full + total_forward,
             moving_meta_t_full["shape_t"], moving_meta_t_full["spacing_t"],
             moving_meta_t_full["origin_t"], moving_meta_t_full["direction_t"],
         ),
-        mode="bilinear", padding_mode=padding_mode, align_corners=True,
+        output_interpolator, padding_mode,
     )
-    warpedfixout = grid_sample(
+    warpedfixout = _sample_output(
         ants_image_to_tensor(fixed, resolved_device, dtype, normalize=False),
         physical_to_normalized_torch_cached(
             X_phys_full + total_inverse,
             fixed_meta_t_full["shape_t"], fixed_meta_t_full["spacing_t"],
             fixed_meta_t_full["origin_t"], fixed_meta_t_full["direction_t"],
         ),
-        mode="bilinear", padding_mode=padding_mode, align_corners=True,
+        output_interpolator, padding_mode,
     )
     if fod_registration is not None:
         # Reorient the warped FODs by the Jacobians of the total pull-back maps.
@@ -1742,6 +1773,7 @@ def syn_registration(
             "fod_lmax": tuple(fod_lmax) if fod else None,
             "fod_directions": fod_directions if fod else None,
             "fod_modulate": fod_modulate if fod else None,
+            "output_interpolator": output_interpolator,
             "affine_fit": affine_result is not None,
             "device": str(resolved_device),
             "outprefix": resolved_outprefix,

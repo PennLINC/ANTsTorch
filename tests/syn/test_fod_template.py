@@ -113,15 +113,50 @@ def test_sharpen_vector_image_matches_per_channel_scalar_sharpening():
     np.testing.assert_allclose(np.asarray(out.direction), np.asarray(image.direction))
 
 
-def test_resample_vector_onto_identity_and_shifted_grid():
+@pytest.mark.parametrize("interpolator", ["linear", "cubic"])
+def test_resample_vector_onto_identity_and_shifted_grid(interpolator):
     image = _fod_image((10, 11, 12), (5, 5, 6))
-    same = _resample_vector_onto(image, image)
+    same = _resample_vector_onto(image, image, interpolator=interpolator)
     np.testing.assert_allclose(same.numpy(), image.numpy(), atol=1e-6)
+    # a copy of the grid (not the same object) still reproduces the voxel values with an interpolating kernel
+    copy = ants.from_numpy(image.numpy() * 0.0, origin=image.origin, spacing=image.spacing, direction=image.direction, has_components=True)
+    np.testing.assert_allclose(_resample_vector_onto(image, copy, interpolator=interpolator).numpy(), image.numpy(), atol=1e-5)
     shifted = _fod_image((10, 11, 12), (5, 5, 6), origin=(-19.0, -17.0, 6.0))
-    out = _resample_vector_onto(image, shifted)
+    out = _resample_vector_onto(image, shifted, interpolator=interpolator)
+    if interpolator == "cubic":
+        # closer to the analytic shifted image than trilinear resampling (the inputs are smooth blobs)
+        # the target grid's origin is 1 mm further along each LPS axis: with direction diag(-1, -1, 1) and
+        # 2 mm voxels, target voxel (i, j, k) samples the source at (i - 0.5, j - 0.5, k + 0.5), so the blob
+        # (centered in (z, y, x) index order) moves to (cz - 0.5, cy + 0.5, cx + 0.5)
+        truth = _fod_image((10, 11, 12), (4.5, 5.5, 6.5)).numpy()
+        linear = _resample_vector_onto(image, shifted, interpolator="linear").numpy()
+        inner = (slice(2, -2),) * 3
+        assert np.abs(out.numpy() - truth)[inner].mean() < np.abs(linear - truth)[inner].mean()
+        return
     expected = ants.resample_image_to_target(ants.split_channels(image)[0], ants.split_channels(shifted)[0], interp_type="linear").numpy()
     inner = (slice(1, -1),) * 3
     np.testing.assert_allclose(out.numpy()[..., 0][inner], expected[inner], atol=1e-4)
+
+
+def test_warp_sh_template_scalar_cubic_identity_and_rotation(tmp_path):
+    """Without a transform the cubic path returns the template unchanged; with ``fod_tools=None`` nothing is reoriented."""
+    rng = np.random.default_rng(1)
+    scalar = ants.from_numpy(
+        np.ascontiguousarray(rng.random((12, 11, 10), dtype=np.float32)), origin=(-20.0, -18.0, 5.0), spacing=(2.0, 2.0, 2.0), direction=_DIRECTION
+    )
+    identity_fn = str(tmp_path / "identity.mat")
+    write_affine_transform(torch.eye(3, dtype=torch.float64), torch.zeros(3, dtype=torch.float64), 3, identity_fn)
+    zero_warp = ants.from_numpy(np.zeros(scalar.shape + (3,), dtype=np.float32), origin=scalar.origin, spacing=scalar.spacing, direction=scalar.direction, has_components=True)
+    for interpolator in ("linear", "cubic", "nearest"):
+        got = _warp_sh_template(scalar, zero_warp, identity_fn, None, interpolator)
+        np.testing.assert_allclose(got.numpy(), scalar.numpy(), atol=1e-5)
+    # the approximating B-spline does not reproduce the voxel values
+    assert np.abs(_warp_sh_template(scalar, zero_warp, identity_fn, None, "bspline").numpy() - scalar.numpy()).max() > 1e-2
+    # a translation by one voxel is exact for an interpolating kernel (away from the borders)
+    shift_fn = str(tmp_path / "shift.mat")
+    write_affine_transform(torch.eye(3, dtype=torch.float64), torch.tensor([-2.0, 0.0, 0.0], dtype=torch.float64), 3, shift_fn)
+    got = _warp_sh_template(scalar, None, shift_fn, None, "cubic").numpy()
+    np.testing.assert_allclose(got[1:, :, :], scalar.numpy()[:-1, :, :], atol=1e-5)
 
 
 def test_build_template_fod_runs_and_returns_a_vector_template(tmp_path):
@@ -141,6 +176,19 @@ def test_build_template_fod_runs_and_returns_a_vector_template(tmp_path):
     assert all(r["l2_norm"] >= 0.0 for r in result["shape_residuals"])
     assert all(w.components == images[0].components for w in result["warped_images"])
     assert os.path.exists(os.path.join(str(tmp_path), "avgWarp_0.nii.gz"))
+    with pytest.raises(ValueError, match="output_interpolator"):
+        build_template(image_list=images, iterations=1, output_dir=str(tmp_path), fod=True, levels=(1,), reg_iterations=(1,), device="cpu", output_interpolator="sinc")
+
+
+def test_build_template_scalar_cubic_template_update(tmp_path):
+    images = [ants.split_channels(_fod_image((12, 13, 14), c))[0] for c in ((6, 6, 7), (5, 7, 8), (7, 6, 6))]
+    result = build_template(
+        image_list=images, iterations=1, gradient_step=0.2, blending_weight=1.0, output_dir=str(tmp_path),
+        type_of_transform="SyN", levels=(2, 1), reg_iterations=(3, 2), affine_iterations=(10, 10, 10), affine_multi_start=False,
+        device="cpu", output_interpolator="cubic",
+    )
+    assert result["template"].components == 1 and np.isfinite(result["template"].numpy()).all()
+    assert tuple(result["template"].shape) == tuple(images[0].shape)
 
 
 def test_build_template_fod_rejects_mismatched_components(tmp_path):

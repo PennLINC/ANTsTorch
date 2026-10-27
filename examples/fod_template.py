@@ -4,7 +4,9 @@ The inputs are MRtrix3-convention SH images stored as 4-D NIfTI files (convert
 ``.mif`` files with ``mrconvert``). Each iteration registers every image to the
 current template with FOD reorientation, averages the warped images per
 coefficient, moves the template by a fraction of the mean warp (with
-reorientation) and sharpens it per coefficient.
+reorientation) and sharpens it per coefficient. Warped images and the template
+are resampled with an interpolating cubic kernel by default, like MRtrix3's
+``mrtransform``, so the template keeps the angular contrast of its inputs.
 """
 import argparse
 from pathlib import Path
@@ -22,6 +24,8 @@ def main():
     parser.add_argument("--flow-sigma", type=float, default=2.0, help="update field smoothing (voxels)")
     parser.add_argument("--total-sigma", type=float, default=2.0, help="total field smoothing (mm; 0 disables)")
     parser.add_argument("--reg-iterations", type=int, nargs="+", default=(50, 50, 50))
+    parser.add_argument("--output-interpolator", default="cubic", choices=("linear", "cubic", "bspline", "nearest"),
+                        help="interpolation of the warped images and of the template in the shape update")
     args = parser.parse_args()
     from antstorch.syn import build_template
     from antstorch.syn.fod import fod_image_read, fod_image_write
@@ -32,7 +36,8 @@ def main():
         image_list=images, iterations=args.iterations, gradient_step=args.gradient_step,
         blending_weight=args.blending_weight, output_dir=str(args.output_dir / "work"), type_of_transform="SyN",
         fod=True, syn_metric=args.metric, levels=(4, 2, 1), reg_iterations=tuple(args.reg_iterations),
-        flow_sigma=args.flow_sigma, total_sigma=args.total_sigma, device=args.device, verbose=True,
+        flow_sigma=args.flow_sigma, total_sigma=args.total_sigma, output_interpolator=args.output_interpolator,
+        device=args.device, verbose=True,
     )
     fod_image_write(result["template"], str(args.output_dir / "template.nii.gz"))
     for path, warped in zip(args.images, result["warped_images"]):

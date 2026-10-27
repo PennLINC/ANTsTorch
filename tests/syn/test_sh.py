@@ -195,3 +195,47 @@ def test_linear_reorientation_matches_mrtransform(tmp_path, modulate):
     transform = torch.as_tensor(np.linalg.inv(linear), dtype=torch.float64)
     expected = reorienter.reorient_coefficients(torch.as_tensor(fod, dtype=torch.float64)[None], transform, modulate=modulate)[0]
     np.testing.assert_allclose(out[2, 3, 3], expected.numpy(), atol=1e-5)
+
+
+@_needs_mrtrix
+def test_cubic_resampling_matches_mrtransform(tmp_path):
+    """``_sample_like_itk(..., 'cubic')`` reproduces ``mrtransform -interp cubic`` (Hermite spline, tension 0) everywhere."""
+    nib = pytest.importorskip("nibabel")
+    from antstorch.syn.template import _sample_like_itk
+
+    rng = np.random.default_rng(3)
+    shape = (9, 10, 11)  # NIfTI (x, y, z) sizes
+    # a smooth field plus noise; two volumes, to cover the vector path
+    ii, jj, kk = np.meshgrid(*[np.arange(n, dtype=np.float64) for n in shape], indexing="ij")  # x, y, z voxel indices
+    smooth = np.sin(ii / 2.0) * np.cos(jj / 3.0) + 0.5 * np.sin(kk / 1.5)
+    image = np.stack([smooth + 0.3 * rng.standard_normal(shape), 2.0 * smooth], axis=-1).astype(np.float32)
+    nib.save(nib.Nifti1Image(image, np.diag([2.0, 2.0, 2.0, 1.0])), str(tmp_path / "in.nii.gz"))
+    shift_mm = np.array([1.1, -0.8, 0.6])  # 0.55, -0.4, 0.3 voxels; avoids the exact half-voxel bound
+    matrix = np.eye(4)
+    matrix[:3, 3] = shift_mm
+    np.savetxt(str(tmp_path / "shift.txt"), matrix)
+    subprocess.run(
+        [
+            os.path.join(_MRTRIX_BIN, "mrtransform"), str(tmp_path / "in.nii.gz"), "-linear", str(tmp_path / "shift.txt"),
+            "-template", str(tmp_path / "in.nii.gz"), "-interp", "cubic", "-reorient_fod", "no", str(tmp_path / "out.nii.gz"), "-quiet",
+        ],
+        check=True,
+    )
+    expected = nib.load(str(tmp_path / "out.nii.gz")).get_fdata()
+    # mrtransform samples the input at (template point + shift): in voxel units, index + shift / 2
+    tensor = torch.as_tensor(np.ascontiguousarray(image.transpose(3, 2, 1, 0)), dtype=torch.float64)[None]  # (1, C, z, y, x)
+    normalized = [2.0 * torch.as_tensor(index + s / 2.0) / (n - 1) - 1.0 for index, s, n in zip((ii, jj, kk), shift_mm, shape)]
+    coords = torch.stack(normalized, dim=-1).permute(2, 1, 0, 3)[None]  # (1, z, y, x, 3) with (x, y, z) components
+    sampled = _sample_like_itk(tensor, coords, torch.tensor(shape[::-1]), "cubic")[0]  # (C, z, y, x)
+    got = sampled.permute(3, 2, 1, 0).numpy()
+    np.testing.assert_allclose(got, expected, atol=1e-5)
+    # and the trilinear path against mrtransform's linear interpolation
+    subprocess.run(
+        [
+            os.path.join(_MRTRIX_BIN, "mrtransform"), str(tmp_path / "in.nii.gz"), "-linear", str(tmp_path / "shift.txt"),
+            "-template", str(tmp_path / "in.nii.gz"), "-interp", "linear", "-reorient_fod", "no", str(tmp_path / "lin.nii.gz"), "-quiet",
+        ],
+        check=True,
+    )
+    linear = _sample_like_itk(tensor, coords, torch.tensor(shape[::-1]), "linear")[0].permute(3, 2, 1, 0).numpy()
+    np.testing.assert_allclose(linear, nib.load(str(tmp_path / "lin.nii.gz")).get_fdata(), atol=1e-5)

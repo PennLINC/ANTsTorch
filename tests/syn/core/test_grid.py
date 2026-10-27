@@ -5,6 +5,7 @@ import torch.nn.functional as F
 
 from antstorch.syn.core import (
     grid_sample_bspline_torch,
+    grid_sample_cubic_torch,
     AnalyticalGridSample,
     grid_sample_nd,
     compose_grids,
@@ -48,6 +49,52 @@ def test_grid_sample_bspline_torch_rejects_1d_image():
     grid = torch.randn(1, 3, 1, dtype=torch.double)
     with pytest.raises(ValueError, match="2-D and 3-D"):
         grid_sample_bspline_torch(image, grid)
+
+
+def test_grid_sample_cubic_interpolates_voxel_values_exactly():
+    torch.manual_seed(3)
+    image = torch.randn(1, 2, 6, 7, 8, dtype=torch.double)
+    sampled = grid_sample_cubic_torch(image, _identity_grid(image.shape[2:]))
+    torch.testing.assert_close(sampled, image, atol=1e-12, rtol=0)
+    # the B-spline sampler only approximates the voxel values
+    approx = grid_sample_bspline_torch(image, _identity_grid(image.shape[2:]))
+    assert (approx - image).abs().max() > 1e-2
+
+
+def test_grid_sample_cubic_reproduces_quadratics_between_voxels():
+    shape = (7, 8, 9)
+    zz, yy, xx = torch.meshgrid(*[torch.arange(n, dtype=torch.double) for n in shape], indexing='ij')
+    poly = lambda z, y, x: 0.5 * x * x - 0.3 * y * y + 0.2 * z * z + 0.7 * x * y - 1.1 * y * z + 2.0 * x - 3.0 * z + 4.0
+    image = poly(zz, yy, xx)[None, None]
+    # sample at offsets inside the image, two voxels away from the borders
+    offsets = torch.tensor([0.5, -0.4, 0.3], dtype=torch.double)
+    zq, yq, xq = (zz + offsets[0])[2:-2, 2:-2, 2:-2], (yy + offsets[1])[2:-2, 2:-2, 2:-2], (xx + offsets[2])[2:-2, 2:-2, 2:-2]
+    grid = torch.stack([2 * xq / (shape[2] - 1) - 1, 2 * yq / (shape[1] - 1) - 1, 2 * zq / (shape[0] - 1) - 1], dim=-1)[None]
+    sampled = grid_sample_cubic_torch(image, grid)
+    torch.testing.assert_close(sampled[0, 0], poly(zq, yq, xq), atol=1e-10, rtol=0)
+    linear = F.grid_sample(image, grid, mode='bilinear', padding_mode='border', align_corners=True)
+    assert (linear[0, 0] - poly(zq, yq, xq)).abs().max() > 1e-2
+
+
+def test_grid_sample_cubic_partition_of_unity_and_zero_padding():
+    image = torch.full((1, 1, 5, 6), 1.5, dtype=torch.double)
+    torch.manual_seed(4)
+    grid = torch.rand(1, 4, 4, 2, dtype=torch.double) * 2 - 1
+    torch.testing.assert_close(grid_sample_cubic_torch(image, grid), torch.full((1, 1, 4, 4), 1.5, dtype=torch.double))
+    far = torch.full((1, 1, 1, 2), 3.0, dtype=torch.double)
+    assert grid_sample_cubic_torch(image, far, padding_mode='zeros').abs().max() == 0.0
+    torch.testing.assert_close(grid_sample_cubic_torch(image, far, padding_mode='border'), torch.full((1, 1, 1, 1), 1.5, dtype=torch.double))
+    with pytest.raises(ValueError, match="padding_mode"):
+        grid_sample_cubic_torch(image, grid, padding_mode='reflection')
+
+
+def test_grid_sample_nd_cubic_alias_matches_direct_call():
+    torch.manual_seed(5)
+    image = torch.randn(1, 1, 5, 6, 7, dtype=torch.double)
+    grid = torch.rand(1, 3, 3, 3, 3, dtype=torch.double) * 2 - 1
+    expected = grid_sample_cubic_torch(image, grid)
+    torch.testing.assert_close(grid_sample_nd(image, grid, interpolator='cubic'), expected)
+    torch.testing.assert_close(grid_sample_nd(image, grid, mode='cubic'), expected)
 
 
 def test_grid_sample_nd_default_matches_functional_grid_sample():

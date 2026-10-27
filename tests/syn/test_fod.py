@@ -180,6 +180,10 @@ def test_syn_registration_fod_validation():
     scalar = ants.split_channels(fixed)[0]
     with pytest.raises(ValueError):
         syn_registration(scalar, scalar, type_of_transform="SyNOnly", fod=True, levels=(1,), reg_iterations=(1,))
+    with pytest.raises(ValueError, match="output_interpolator"):
+        syn_registration(fixed, moving, type_of_transform="SyNOnly", fod=True, levels=(1,), reg_iterations=(1,), output_interpolator="sinc")
+    with pytest.raises(ValueError, match="padding_mode"):
+        syn_registration(fixed, moving, type_of_transform="SyNOnly", fod=True, levels=(1,), reg_iterations=(1,), padding_mode="reflection")
 
 
 @pytest.mark.parametrize("metric", ["lncc_joint", "mse"])
@@ -209,6 +213,24 @@ def test_syn_registration_fod_default_schedule_metric_and_affine_on_l0():
     provenance = result["provenance"]
     assert provenance["syn_metric"] == "lncc_joint"
     assert provenance["fod_lmax"] == (0, 2)
+    assert provenance["output_interpolator"] == "cubic"
     assert result["affine_matrix"].shape == (3, 3)
     assert result["warpedmovout"].components == fixed.components
     assert result["fwdtransforms"][-1].endswith("0GenericAffine.mat")
+
+
+def test_output_interpolator_default_and_cubic_outputs():
+    fixed = _fod_image((10, 10, 10), (5, 5, 5))
+    moving = _fod_image((10, 10, 10), (4, 5, 6))
+    scalar_fixed, scalar_moving = ants.split_channels(fixed)[0], ants.split_channels(moving)[0]
+    kw = dict(type_of_transform="SyNOnly", levels=(1,), reg_iterations=(2,), device="cpu")
+    scalar = syn_registration(scalar_fixed, scalar_moving, **kw)
+    assert scalar["provenance"]["output_interpolator"] == "linear"
+    linear = syn_registration(fixed, moving, fod=True, output_interpolator="linear", **kw)
+    cubic = syn_registration(fixed, moving, fod=True, **kw)
+    assert cubic["provenance"]["output_interpolator"] == "cubic"
+    assert cubic["warpedmovout"].components == fixed.components
+    difference = np.abs(cubic["warpedmovout"].numpy() - linear["warpedmovout"].numpy())
+    assert np.isfinite(cubic["warpedmovout"].numpy()).all() and difference.max() > 1e-4
+    # the same warp drives both outputs, so they agree where the image is smooth
+    assert difference.mean() < 0.1 * np.abs(linear["warpedmovout"].numpy()).mean()

@@ -13,20 +13,130 @@ import torch.nn.functional as F
 from ..._torch_compat import grid_sample
 
 
+def _bspline_weights(u):
+    """Cubic B-spline weights of the 4 neighbors ``i-1, i, i+1, i+2`` for the fractional offset ``u``."""
+    u2 = u * u
+    u3 = u2 * u
+    w0 = (1.0 - u) ** 3 / 6.0
+    w1 = (4.0 - 6.0 * u2 + 3.0 * u3) / 6.0
+    w2 = (1.0 + 3.0 * u + 3.0 * u2 - 3.0 * u3) / 6.0
+    w3 = u3 / 6.0
+    return [w0, w1, w2, w3]
+
+
+def _catmull_rom_weights(u):
+    """Catmull-Rom (Keys, a = -1/2) weights of the 4 neighbors ``i-1, i, i+1, i+2`` for the fractional offset ``u``.
+
+    Identical to the Hermite spline with zero tension used by MRtrix3's cubic
+    interpolator (``Math::Hermite``).
+    """
+    u2 = u * u
+    u3 = u2 * u
+    w0 = 0.5 * (2.0 * u2 - u3 - u)
+    w1 = 1.0 + 1.5 * u3 - 2.5 * u2
+    w2 = 2.0 * u2 + 0.5 * u - 1.5 * u3
+    w3 = 0.5 * (u3 - u2)
+    return [w0, w1, w2, w3]
+
+
+def _grid_sample_separable_cubic(image, grid, get_w, padding_mode='border', align_corners=True):
+    """Shared 4-tap separable sampler behind :func:`grid_sample_bspline_torch` and :func:`grid_sample_cubic_torch`."""
+    ndim = image.ndim - 2
+    if ndim not in (2, 3):
+        raise ValueError(f"Only 2-D and 3-D grid sampling are supported, got ndim={ndim}")
+    if padding_mode not in ('border', 'zeros'):
+        raise ValueError(f"padding_mode must be 'border' or 'zeros', got {padding_mode!r}")
+
+    B, C = image.shape[:2]
+    device = image.device
+    dtype = image.dtype
+    spatial_target = grid.shape[1:-1]
+
+    if ndim == 2:
+        H, W = image.shape[2:]
+        gx, gy = grid[..., 0], grid[..., 1]
+        vx = (gx + 1.0) * (W - 1) / 2.0 if align_corners else (gx + 1.0) * W / 2.0 - 0.5
+        vy = (gy + 1.0) * (H - 1) / 2.0 if align_corners else (gy + 1.0) * H / 2.0 - 0.5
+        ix, iy = torch.floor(vx), torch.floor(vy)
+        ux, uy = vx - ix, vy - iy
+        wx, wy = get_w(ux), get_w(uy)
+
+        out = torch.zeros((B, C, *spatial_target), device=device, dtype=dtype)
+        img_flat = image.reshape(B, C, H * W)
+
+        for ky in range(4):
+            jy_raw = (iy + ky - 1).long()
+            jy = jy_raw.clamp(0, H - 1)
+            valid_y = (jy_raw >= 0) & (jy_raw < H)
+            w_y = wy[ky].unsqueeze(1)
+            for kx in range(4):
+                jx_raw = (ix + kx - 1).long()
+                jx = jx_raw.clamp(0, W - 1)
+                valid_x = (jx_raw >= 0) & (jx_raw < W)
+                w_yx = w_y * wx[kx].unsqueeze(1)
+                idx = (jy * W + jx).reshape(B, 1, -1).expand(B, C, -1)
+                sampled_flat = torch.gather(img_flat, 2, idx)
+                sampled = sampled_flat.view(B, C, *spatial_target)
+                if padding_mode == 'zeros':
+                    valid_mask = (valid_y & valid_x).view(B, 1, *spatial_target)
+                    sampled = sampled * valid_mask
+                out = out + w_yx * sampled
+        return out
+    else:
+        D, H, W = image.shape[2:]
+        gx, gy, gz = grid[..., 0], grid[..., 1], grid[..., 2]
+        vx = (gx + 1.0) * (W - 1) / 2.0 if align_corners else (gx + 1.0) * W / 2.0 - 0.5
+        vy = (gy + 1.0) * (H - 1) / 2.0 if align_corners else (gy + 1.0) * H / 2.0 - 0.5
+        vz = (gz + 1.0) * (D - 1) / 2.0 if align_corners else (gz + 1.0) * D / 2.0 - 0.5
+        ix, iy, iz = torch.floor(vx), torch.floor(vy), torch.floor(vz)
+        ux, uy, uz = vx - ix, vy - iy, vz - iz
+        wx, wy, wz = get_w(ux), get_w(uy), get_w(uz)
+
+        out = torch.zeros((B, C, *spatial_target), device=device, dtype=dtype)
+        img_flat = image.reshape(B, C, D * H * W)
+
+        for kz in range(4):
+            jz_raw = (iz + kz - 1).long()
+            jz = jz_raw.clamp(0, D - 1)
+            valid_z = (jz_raw >= 0) & (jz_raw < D)
+            w_z = wz[kz].unsqueeze(1)
+            for ky in range(4):
+                jy_raw = (iy + ky - 1).long()
+                jy = jy_raw.clamp(0, H - 1)
+                valid_y = (jy_raw >= 0) & (jy_raw < H)
+                w_zy = w_z * wy[ky].unsqueeze(1)
+                for kx in range(4):
+                    jx_raw = (ix + kx - 1).long()
+                    jx = jx_raw.clamp(0, W - 1)
+                    valid_x = (jx_raw >= 0) & (jx_raw < W)
+                    w_zyx = w_zy * wx[kx].unsqueeze(1)
+                    idx = (jz * (H * W) + jy * W + jx).reshape(B, 1, -1).expand(B, C, -1)
+                    sampled_flat = torch.gather(img_flat, 2, idx)
+                    sampled = sampled_flat.view(B, C, *spatial_target)
+                    if padding_mode == 'zeros':
+                        valid_mask = (valid_z & valid_y & valid_x).view(B, 1, *spatial_target)
+                        sampled = sampled * valid_mask
+                    out = out + w_zyx * sampled
+        return out
+
+
 def grid_sample_bspline_torch(
     image: torch.Tensor,
     grid: torch.Tensor,
     padding_mode: str = 'border',
     align_corners: bool = True
 ) -> torch.Tensor:
-    """C1-continuous 2-D/3-D cubic B-spline grid sampling.
+    """C2-continuous 2-D/3-D cubic B-spline grid sampling (approximating).
 
     Unlike ``torch.nn.functional.grid_sample`` (which supports only
-    nearest/bilinear/bicubic-2D interpolation), this evaluates a true cubic
-    B-spline interpolant at arbitrary continuous sample locations, in both
-    2-D and 3-D, with a continuous first derivative — useful when a smoother
-    interpolant than trilinear is needed for image resampling or gradient
-    computation.
+    nearest/bilinear/bicubic-2D interpolation), this evaluates a cubic
+    B-spline kernel at arbitrary continuous sample locations, in both 2-D and
+    3-D, with continuous first and second derivatives. The image values are
+    used directly as B-spline coefficients (no prefiltering), so the result
+    is a smoothing approximation of the image rather than an interpolant: it
+    does not pass through the voxel values. Use it when a smooth sampler is
+    needed for gradient computation; for resampling images, where the voxel
+    values should be preserved, see :func:`grid_sample_cubic_torch`.
 
     Parameters
     ----------
@@ -51,90 +161,44 @@ def grid_sample_bspline_torch(
     ValueError
         If ``image`` is not 2-D or 3-D (excluding batch/channel dims).
     """
-    ndim = image.ndim - 2
-    if ndim not in (2, 3):
-        raise ValueError(f"Only 2-D and 3-D grid sampling are supported, got ndim={ndim}")
+    return _grid_sample_separable_cubic(image, grid, _bspline_weights, padding_mode=padding_mode, align_corners=align_corners)
 
-    B, C = image.shape[:2]
-    device = image.device
-    dtype = image.dtype
-    spatial_target = grid.shape[1:-1]
 
-    def get_w(u):
-        u2 = u * u
-        u3 = u2 * u
-        w0 = (1.0 - u) ** 3 / 6.0
-        w1 = (4.0 - 6.0 * u2 + 3.0 * u3) / 6.0
-        w2 = (1.0 + 3.0 * u + 3.0 * u2 - 3.0 * u3) / 6.0
-        w3 = u3 / 6.0
-        return [w0, w1, w2, w3]
+def grid_sample_cubic_torch(
+    image: torch.Tensor,
+    grid: torch.Tensor,
+    padding_mode: str = 'border',
+    align_corners: bool = True
+) -> torch.Tensor:
+    """C1-continuous 2-D/3-D interpolating cubic (Catmull-Rom) grid sampling.
 
-    if ndim == 2:
-        H, W = image.shape[2:]
-        gx, gy = grid[..., 0], grid[..., 1]
-        vx = (gx + 1.0) * (W - 1) / 2.0 if align_corners else (gx + 1.0) * W / 2.0 - 0.5
-        vy = (gy + 1.0) * (H - 1) / 2.0 if align_corners else (gy + 1.0) * H / 2.0 - 0.5
-        ix, iy = torch.floor(vx), torch.floor(vy)
-        ux, uy = vx - ix, vy - iy
-        wx, wy = get_w(ux), get_w(uy)
+    The Catmull-Rom kernel (Keys' cubic convolution with ``a = -1/2``) passes
+    through the voxel values exactly and reproduces polynomials up to degree
+    two, so resampling preserves the image's sharpness far better than
+    trilinear interpolation, at the cost of a small overshoot at edges. It is
+    the same kernel as MRtrix3's default ``cubic`` interpolation
+    (``mrtransform``, ``mrgrid``), which makes it the sampler of choice for
+    FOD images. ``image`` and ``grid`` follow :func:`grid_sample_bspline_torch`.
 
-        out = torch.zeros((B, C, *spatial_target), device=device, dtype=dtype)
-        img_flat = image.view(B, C, H * W)
+    Parameters
+    ----------
+    image : torch.Tensor
+        Image of shape ``(B, C, H, W)`` or ``(B, C, D, H, W)``.
+    grid : torch.Tensor
+        Sample locations in ``[-1, 1]``, of shape ``(B, H_out, W_out, 2)`` or
+        ``(B, D_out, H_out, W_out, 3)``, in ``grid_sample`` axis order.
+    padding_mode : {'border', 'zeros'}
+        Out-of-bounds handling: ``'border'`` clamps to the nearest edge
+        voxel; ``'zeros'`` treats out-of-bounds contributions as zero.
+    align_corners : bool
+        Must be ``True`` (the only convention implemented).
 
-        for ky in range(4):
-            jy_raw = (iy + ky - 1).long()
-            jy = jy_raw.clamp(0, H - 1)
-            valid_y = (jy_raw >= 0) & (jy_raw < H)
-            w_y = wy[ky].unsqueeze(1)
-            for kx in range(4):
-                jx_raw = (ix + kx - 1).long()
-                jx = jx_raw.clamp(0, W - 1)
-                valid_x = (jx_raw >= 0) & (jx_raw < W)
-                w_yx = w_y * wx[kx].unsqueeze(1)
-                idx = (jy * W + jx).view(B, 1, -1).expand(B, C, -1)
-                sampled_flat = torch.gather(img_flat, 2, idx)
-                sampled = sampled_flat.view(B, C, *spatial_target)
-                if padding_mode == 'zeros':
-                    valid_mask = (valid_y & valid_x).view(B, 1, *spatial_target)
-                    sampled = sampled * valid_mask
-                out = out + w_yx * sampled
-        return out
-    else:
-        D, H, W = image.shape[2:]
-        gx, gy, gz = grid[..., 0], grid[..., 1], grid[..., 2]
-        vx = (gx + 1.0) * (W - 1) / 2.0 if align_corners else (gx + 1.0) * W / 2.0 - 0.5
-        vy = (gy + 1.0) * (H - 1) / 2.0 if align_corners else (gy + 1.0) * H / 2.0 - 0.5
-        vz = (gz + 1.0) * (D - 1) / 2.0 if align_corners else (gz + 1.0) * D / 2.0 - 0.5
-        ix, iy, iz = torch.floor(vx), torch.floor(vy), torch.floor(vz)
-        ux, uy, uz = vx - ix, vy - iy, vz - iz
-        wx, wy, wz = get_w(ux), get_w(uy), get_w(uz)
-
-        out = torch.zeros((B, C, *spatial_target), device=device, dtype=dtype)
-        img_flat = image.view(B, C, D * H * W)
-
-        for kz in range(4):
-            jz_raw = (iz + kz - 1).long()
-            jz = jz_raw.clamp(0, D - 1)
-            valid_z = (jz_raw >= 0) & (jz_raw < D)
-            w_z = wz[kz].unsqueeze(1)
-            for ky in range(4):
-                jy_raw = (iy + ky - 1).long()
-                jy = jy_raw.clamp(0, H - 1)
-                valid_y = (jy_raw >= 0) & (jy_raw < H)
-                w_zy = w_z * wy[ky].unsqueeze(1)
-                for kx in range(4):
-                    jx_raw = (ix + kx - 1).long()
-                    jx = jx_raw.clamp(0, W - 1)
-                    valid_x = (jx_raw >= 0) & (jx_raw < W)
-                    w_zyx = w_zy * wx[kx].unsqueeze(1)
-                    idx = (jz * (H * W) + jy * W + jx).view(B, 1, -1).expand(B, C, -1)
-                    sampled_flat = torch.gather(img_flat, 2, idx)
-                    sampled = sampled_flat.view(B, C, *spatial_target)
-                    if padding_mode == 'zeros':
-                        valid_mask = (valid_z & valid_y & valid_x).view(B, 1, *spatial_target)
-                        sampled = sampled * valid_mask
-                    out = out + w_zyx * sampled
-        return out
+    Returns
+    -------
+    torch.Tensor
+        Sampled image of shape ``(B, C, *grid.shape[1:-1])``.
+    """
+    return _grid_sample_separable_cubic(image, grid, _catmull_rom_weights, padding_mode=padding_mode, align_corners=align_corners)
 
 
 def _image_spatial_gradient(image):
@@ -206,8 +270,11 @@ class AnalyticalGridSample(torch.autograd.Function):
         return None, grad_grid, None, None, None
 
 
+_CUBIC_ALIASES = ('cubic', 'catmull_rom', 'catmullRom', 'hermite')
+
+
 def grid_sample_nd(input, grid, mode='bilinear', padding_mode='border', align_corners=True, interpolator='linear', use_analytical_gradients=True):
-    """Dispatching wrapper around ``grid_sample``/:func:`grid_sample_bspline_torch`/:class:`AnalyticalGridSample`.
+    """Dispatching wrapper around ``grid_sample``/:func:`grid_sample_bspline_torch`/:func:`grid_sample_cubic_torch`/:class:`AnalyticalGridSample`.
 
     Parameters
     ----------
@@ -217,7 +284,9 @@ def grid_sample_nd(input, grid, mode='bilinear', padding_mode='border', align_co
         Sample locations in ``[-1, 1]``, of shape ``(B, *spatial_out, dim)``.
     mode : str
         Interpolation mode; accepts ``torch.nn.functional.grid_sample``
-        modes plus ``'bspline'``/``'nearestNeighbor'`` aliases.
+        modes plus the ``'bspline'`` (approximating cubic B-spline),
+        ``'cubic'`` (interpolating Catmull-Rom cubic) and
+        ``'nearestNeighbor'`` aliases.
     padding_mode : str
         Out-of-bounds handling, passed through to the selected backend.
     align_corners : bool
@@ -225,11 +294,11 @@ def grid_sample_nd(input, grid, mode='bilinear', padding_mode='border', align_co
     interpolator : str
         Alternate spelling for ``mode`` (accepted for ANTs-style call
         sites); ``mode`` and ``interpolator`` are checked independently, so
-        either may request ``'bspline'``/``'nearestNeighbor'``.
+        either may request ``'bspline'``/``'cubic'``/``'nearestNeighbor'``.
     use_analytical_gradients : bool
         If ``True`` and ``grid.requires_grad`` while ``input`` does not,
         route through :class:`AnalyticalGridSample` for a cheaper backward
-        pass. Ignored for the B-spline/nearest backends.
+        pass. Ignored for the B-spline/cubic/nearest backends.
 
     Returns
     -------
@@ -240,6 +309,8 @@ def grid_sample_nd(input, grid, mode='bilinear', padding_mode='border', align_co
         mode = 'nearest'
     if interpolator == 'bspline' or mode == 'bspline':
         return grid_sample_bspline_torch(input, grid, padding_mode=padding_mode, align_corners=align_corners)
+    if interpolator in _CUBIC_ALIASES or mode in _CUBIC_ALIASES:
+        return grid_sample_cubic_torch(input, grid, padding_mode=padding_mode, align_corners=align_corners)
     if input.dtype != grid.dtype:
         input = input.to(grid.dtype)
     if use_analytical_gradients and grid.requires_grad and not input.requires_grad:

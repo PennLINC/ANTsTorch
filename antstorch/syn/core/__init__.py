@@ -25,6 +25,7 @@ from .affine import (
 )
 from .grid import (
     grid_sample_bspline_torch,
+    grid_sample_cubic_torch,
     AnalyticalGridSample,
     grid_sample_nd,
     compose_grids,
@@ -107,6 +108,7 @@ __all__ = [
     'parse_ants_affine',
     'compute_initial_grid',
     'grid_sample_bspline_torch',
+    'grid_sample_cubic_torch',
     'AnalyticalGridSample',
     'grid_sample_nd',
     'compose_grids',
