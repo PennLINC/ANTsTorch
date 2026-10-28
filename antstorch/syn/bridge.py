@@ -152,7 +152,8 @@ def tensor_to_ants_image(tensor: Tensor, reference):
     reversed_axes = tuple(range(dimension - 1, -1, -1))
     if tensor.shape[1] > 1:
         # (C, [z,] y, x) -> (x, y[, z], C)
-        array = np.ascontiguousarray(np.transpose(tensor.detach().cpu().numpy()[0], tuple(range(dimension, 0, -1)) + (0,)))
+        channel_last = tuple(range(dimension, 0, -1)) + (0,)
+        array = np.ascontiguousarray(np.transpose(tensor.detach().cpu().numpy()[0], channel_last))
         return ants.from_numpy(
             array,
             origin=reference.origin,

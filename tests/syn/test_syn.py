@@ -998,7 +998,9 @@ def _two_channel(image):
     """A blob and a dimmer copy of it as a 2-component image."""
     array = image.numpy()
     stacked = np.ascontiguousarray(np.stack([array, 0.5 * array], axis=-1))
-    return ants.from_numpy(stacked, origin=image.origin, spacing=image.spacing, direction=image.direction, has_components=True)
+    return ants.from_numpy(
+        stacked, origin=image.origin, spacing=image.spacing, direction=image.direction, has_components=True
+    )
 
 
 def test_syn_registration_rejects_mismatched_components():

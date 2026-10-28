@@ -143,7 +143,8 @@ def read_affine_transform(filename: str, dim: int) -> Tuple[np.ndarray, np.ndarr
     # which has the same (matrix, translation; center) parameterization as an AffineTransform.
     if transform.transform_type not in ("AffineTransform", "MatrixOffsetTransformBase"):
         raise ValueError(
-            f"transform at '{filename}' has type '{transform.transform_type}', expected 'AffineTransform'"
+            f"transform at '{filename}' has type '{transform.transform_type}', "
+            "expected 'AffineTransform' or 'MatrixOffsetTransformBase'"
         )
     params = np.asarray(transform.parameters, dtype=np.float64)
     matrix = np.ascontiguousarray(params[: dim * dim].reshape(dim, dim))

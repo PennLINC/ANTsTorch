@@ -68,7 +68,9 @@ def sh_lmax_of_image(image) -> int:
     return lmax_from_n(components)
 
 
-_ODX_READERS = {".odx": "load", ".mif": "from_mrtrix", ".mif.gz": "from_mrtrix", ".fib.gz": "from_fibgz", ".fz": "from_fz"}
+_ODX_READERS = {
+    ".odx": "load", ".mif": "from_mrtrix", ".mif.gz": "from_mrtrix", ".fib.gz": "from_fibgz", ".fz": "from_fz",
+}
 _ODX_WRITERS = (".odx", ".mif.gz")
 
 
@@ -183,7 +185,9 @@ def fod_image_write(image, filename: str) -> None:
 
 
 def default_fod_lmax(num_levels: int, image_lmax: int, max_lmax: int = 4) -> Tuple[int, ...]:
-    """MRtrix3-like degree schedule: lmax 0 at the coarsest level, then 2, 4, ..., capped at ``min(max_lmax, image_lmax)``.
+    """MRtrix3-like degree schedule: lmax 0 at the coarsest level, then 2, 4, ....
+
+    The values are capped at ``min(max_lmax, image_lmax)``.
 
     ``mrregister`` registers FODs with lmax 0, 2 and 4 at scale factors 0.25,
     0.5 and 1.0; this reproduces that for three levels and keeps the cap for
@@ -195,7 +199,11 @@ def default_fod_lmax(num_levels: int, image_lmax: int, max_lmax: int = 4) -> Tup
 
 
 def _inverse_3x3(matrix: Tensor, eps: float = 1e-6) -> Tensor:
-    """Batched 3x3 inverse by adjugate, with the determinant kept away from zero (folded voxels stay finite)."""
+    """Batched 3x3 inverse by adjugate, with the determinant kept away from zero.
+
+    Folded voxels have singular Jacobians, where ``torch.linalg.inv`` raises or returns inf;
+    the clamped determinant keeps their reorientation finite.
+    """
     a, b, c = matrix[..., 0, 0], matrix[..., 0, 1], matrix[..., 0, 2]
     d, e, f = matrix[..., 1, 0], matrix[..., 1, 1], matrix[..., 1, 2]
     g, h, i = matrix[..., 2, 0], matrix[..., 2, 1], matrix[..., 2, 2]
@@ -211,13 +219,19 @@ def _inverse_3x3(matrix: Tensor, eps: float = 1e-6) -> Tensor:
     det = a * c00 + b * c01 + c * c02
     det = torch.where(det.abs() < eps, torch.where(det < 0, -torch.full_like(det, eps), torch.full_like(det, eps)), det)
     adjugate = torch.stack(
-        [torch.stack([c00, c10, c20], dim=-1), torch.stack([c01, c11, c21], dim=-1), torch.stack([c02, c12, c22], dim=-1)],
+        [
+            torch.stack([c00, c10, c20], dim=-1),
+            torch.stack([c01, c11, c21], dim=-1),
+            torch.stack([c02, c12, c22], dim=-1),
+        ],
         dim=-2,
     )
     return adjugate / det[..., None, None]
 
 
-def pullback_jacobian(displacement: Tensor, spacing: Sequence[float], direction, affine: Optional[Tensor] = None) -> Tensor:
+def pullback_jacobian(
+    displacement: Tensor, spacing: Sequence[float], direction, affine: Optional[Tensor] = None
+) -> Tensor:
     """Jacobian of a pull-back map ``phi(x) = A (x + u(x)) + b`` in ITK physical ``(x, y, z)`` coordinates.
 
     Parameters

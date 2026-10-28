@@ -32,6 +32,7 @@ from typing import Optional, Sequence, Union
 
 import numpy as np
 import torch
+import torch.utils.checkpoint
 from torch import Tensor
 
 __all__ = [
@@ -174,13 +175,14 @@ def apsf_rh(lmax: int, device=None, dtype=torch.float32) -> Tensor:
 
 
 def apsf_matrix(directions: Tensor, lmax: int) -> Tensor:
-    """SH coefficients of one apodized PSF per direction, as columns of an ``(n_coefficients, n_directions)`` matrix.
+    """The ``(n_coefficients, n_directions)`` matrix of SH coefficients of one apodized PSF per direction.
 
     Equals MRtrix3's ``aPSF_weights_to_FOD_transform``: the SH delta function at
     each direction, spherically convolved with the aPSF kernel.
     """
     basis = sh_basis(directions, lmax)  # (n_directions, n_coefficients)
-    gain = apsf_rh(lmax, device=directions.device, dtype=directions.dtype)[coefficient_degrees(lmax, directions.device) // 2]
+    degrees = coefficient_degrees(lmax, directions.device)
+    gain = apsf_rh(lmax, device=directions.device, dtype=directions.dtype)[degrees // 2]
     return (basis * gain).transpose(0, 1).contiguous()
 
 
@@ -191,7 +193,9 @@ def spherical_to_cartesian(az_el: Union[Tensor, np.ndarray]) -> Tensor:
     return torch.stack([torch.sin(el) * torch.cos(az), torch.sin(el) * torch.sin(az), torch.cos(el)], dim=-1)
 
 
-def load_directions(source: Union[str, int, Tensor, np.ndarray, Sequence] = 60, *, device=None, dtype=torch.float32) -> Tensor:
+def load_directions(
+    source: Union[str, int, Tensor, np.ndarray, Sequence] = 60, *, device=None, dtype=torch.float32
+) -> Tensor:
     """Load a direction set as ``(n, 3)`` unit vectors.
 
     ``source`` may be the integer ``60`` or ``300`` (the electrostatic-repulsion
@@ -208,7 +212,9 @@ def load_directions(source: Union[str, int, Tensor, np.ndarray, Sequence] = 60, 
     if isinstance(source, str):
         rows = np.loadtxt(source, comments="#", ndmin=2)
     else:
-        rows = np.asarray(torch.as_tensor(source).detach().cpu().numpy() if isinstance(source, Tensor) else source, dtype=np.float64)
+        if isinstance(source, Tensor):
+            source = source.detach().cpu().numpy()
+        rows = np.asarray(source, dtype=np.float64)
     if rows.ndim != 2 or rows.shape[1] not in (2, 3):
         raise ValueError("directions must be an (n, 2) [azimuth inclination] or (n, 3) [x y z] array")
     if rows.shape[1] == 2:
@@ -222,6 +228,13 @@ def load_directions(source: Union[str, int, Tensor, np.ndarray, Sequence] = 60, 
 class FODReorienter:
     """Apodized-PSF reorientation of SH FOD images under a local linear map.
 
+    The ``transforms`` passed to :meth:`reorient` map fiber directions of the
+    input FOD to directions of the output FOD, in the frame the SH series is
+    expressed in. For a pull-back (output to input) deformation ``phi`` this
+    is the inverse of its Jacobian, ``(d phi / d x)^-1``, as in MRtrix3's
+    ``Registration::Transform::reorient``. Registrations use it through
+    :class:`antstorch.syn.fod.FODReorientation`.
+
     Parameters
     ----------
     lmax : int
@@ -232,14 +245,6 @@ class FODReorienter:
         directions in ``mrregister`` and 300 in ``mrtransform``.
     device, dtype
         Where the precomputed matrices live.
-
-    Notes
-    -----
-    The ``transforms`` passed to :meth:`reorient` map fiber directions of the
-    *input* FOD to directions of the *output* FOD, in the frame the SH series is
-    expressed in. For a pull-back (output to input) deformation ``phi`` this is
-    the inverse of its Jacobian, ``(d phi / d x)^-1``, as in MRtrix3's
-    ``Registration::Transform::reorient``.
     """
 
     def __init__(self, lmax: int, directions=60, *, device=None, dtype: torch.dtype = torch.float32):
@@ -256,11 +261,13 @@ class FODReorienter:
         forward = apsf_matrix(self.directions, self.lmax)  # (n_coefficients, n_directions), float64
         self.fod_to_weights = torch.linalg.pinv(forward).to(dtype=dtype)  # (n_directions, n_coefficients)
         self.directions = self.directions.to(dtype=dtype)
-        self.band_gain = apsf_rh(self.lmax, device=device, dtype=dtype)[coefficient_degrees(self.lmax, device) // 2]
+        degrees = coefficient_degrees(self.lmax, device)
+        self.band_gain = apsf_rh(self.lmax, device=device, dtype=dtype)[degrees // 2]
         self.device = self.fod_to_weights.device
         self.dtype = dtype
 
     def to(self, device=None, dtype=None) -> "FODReorienter":
+        """Move the precomputed matrices to ``device``/``dtype``; returns ``self``."""
         self.fod_to_weights = self.fod_to_weights.to(device=device, dtype=dtype)
         self.directions = self.directions.to(device=device, dtype=dtype)
         self.band_gain = self.band_gain.to(device=device, dtype=dtype)
@@ -365,9 +372,7 @@ class FODReorienter:
             coefficients = flat[chunk]
             chunk_transforms = transforms if flat_transforms is None else flat_transforms[chunk]
             if checkpoint and coefficients.requires_grad:
-                from torch.utils.checkpoint import checkpoint as _checkpoint
-
-                reoriented = _checkpoint(
+                reoriented = torch.utils.checkpoint.checkpoint(
                     lambda c, t: self.reorient_coefficients(c, t, modulate=modulate),
                     coefficients,
                     chunk_transforms,

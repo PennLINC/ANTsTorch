@@ -219,13 +219,9 @@ def local_ncc_loss_nd(
     Parameters
     ----------
     I, J : torch.Tensor
-        Image tensors of shape ``(B, C, *spatial)``. With ``C > 1`` and
-        ``joint_channels=False`` the correlation is computed per channel and
-        averaged over channels and voxels; with ``joint_channels=True`` the
-        window moments (variances and covariance) are summed over the
-        channels first, which treats each voxel's channels as one vector
-        and weights channels by their local variance (the natural extension
-        of CC to vector-valued images such as spherical harmonic series).
+        Image tensors of shape ``(B, C, *spatial)``. With ``C > 1`` the
+        correlation is computed per channel and averaged over channels and
+        voxels, unless ``joint_channels``.
     mask : torch.Tensor, optional
         Binary mask of shape ``(B, 1, *spatial)`` identifying active
         evaluation voxels.
@@ -240,6 +236,11 @@ def local_ncc_loss_nd(
     squared : bool
         If ``True``, optimize squared LNCC (CC^2) instead of CC — a
         multi-modal-friendlier metric.
+    joint_channels : bool
+        If ``True``, sum the window variances and covariance over the
+        channels before forming the correlation, which treats each voxel's
+        channels as one vector (CC of vector-valued images); channels are
+        weighted by their local variance. Autograd path only.
 
     Returns
     -------
@@ -261,7 +262,9 @@ def local_ncc_loss_nd(
             window_size = max(1, window_size - 1)
 
     if use_ants_pseudo_gradient and joint_channels:
-        raise ValueError("joint_channels=True is only available with the autograd (pooling) LNCC path")
+        raise ValueError(
+            "joint_channels=True is only available with the autograd (pooling) LNCC path"
+        )
     if use_ants_pseudo_gradient and squared:
         return ANTsPseudoLNCC.apply(I, J, mask, window_size)
     elif use_ants_pseudo_gradient and not squared:

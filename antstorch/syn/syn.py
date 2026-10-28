@@ -435,10 +435,13 @@ def _prepare_extra_contrasts(fixed, moving, extra_contrasts, extra_contrast_weig
         for image, role in ((fixed_extra, "fixed"), (moving_extra, "moving")):
             if image.components != 1:
                 raise ValueError(
-                    f"extra_contrasts[{k}] ({role}): extra contrasts must be scalar images, got {image.components} components"
+                    f"extra_contrasts[{k}] ({role}): extra contrasts must be scalar images, "
+                    f"got {image.components} components"
                 )
             if image.dimension != fixed.dimension:
-                raise ValueError(f"extra_contrasts[{k}] ({role}) is {image.dimension}-D, the primary images are {fixed.dimension}-D")
+                raise ValueError(
+                    f"extra_contrasts[{k}] ({role}) is {image.dimension}-D, the primary images are {fixed.dimension}-D"
+                )
         pairs.append((_resample_scalar_onto(fixed_extra, fixed), _resample_scalar_onto(moving_extra, moving)))
     if extra_contrast_weights is None:
         weights = (1.0,) * len(pairs)
@@ -808,11 +811,13 @@ def _fit_syn_level(
                     enforce_stationary_boundary=bspline_enforce_stationary_boundary,
                 )
         elif total_sigma > 0:
-            # Same units as flow_sigma: voxels of the current level under the default gaussian_sigma_mode='voxel',
-            # the way antsRegistration's SyN[step, updateFieldVarianceInVoxelSpace, totalFieldVarianceInVoxelSpace]
-            # keeps both variances in voxel space and constant across levels.
-            warp_l2r = separable_gaussian_filter(warp_l2r, total_sigma, spacing=fixed_meta["spacing"], sigma_mode=gaussian_sigma_mode)
-            warp_r2l = separable_gaussian_filter(warp_r2l, total_sigma, spacing=fixed_meta["spacing"], sigma_mode=gaussian_sigma_mode)
+            # Same units as flow_sigma (gaussian_sigma_mode); see the total_sigma paragraph in the docstring.
+            warp_l2r = separable_gaussian_filter(
+                warp_l2r, total_sigma, spacing=fixed_meta["spacing"], sigma_mode=gaussian_sigma_mode
+            )
+            warp_r2l = separable_gaussian_filter(
+                warp_r2l, total_sigma, spacing=fixed_meta["spacing"], sigma_mode=gaussian_sigma_mode
+            )
 
         # Nothing inside this loop reads warp_*_inv (prepare_mid_images_and_
         # gradients_torch accepts them but never uses them); they only feed the
@@ -1197,8 +1202,7 @@ def syn_registration(
     the ANTs variance, so ANTs' default ``SyN[0.1,3,0]`` is
     ``flow_sigma=sqrt(3)``, ``total_sigma=0``). With ``'physical'`` both
     are in millimeters, divided by the level's spacing per axis and
-    clamped to 0.5 to 10 voxels. (Before this change ``total_sigma`` was
-    always physical regardless of the mode.)
+    clamped to 0.5 to 10 voxels.
 
     ``regularizer='bspline'`` is the ANTs/ITK ``BSplineSyN`` regularizer: a
     single-level cubic B-spline fit (via
@@ -1834,12 +1838,11 @@ def syn_registration(
         fixed_meta_t_full["shape_t"], fixed_meta_t_full["spacing_t"],
         fixed_meta_t_full["origin_t"], fixed_meta_t_full["direction_t"],
     )
-    warpedmovout = _sample_output(
-        ants_image_to_tensor(moving, resolved_device, dtype, normalize=False), forward_coords, output_interpolator, padding_mode
-    )
-    warpedfixout = _sample_output(
-        ants_image_to_tensor(fixed, resolved_device, dtype, normalize=False), inverse_coords, output_interpolator, padding_mode
-    )
+    moving_full = ants_image_to_tensor(moving, resolved_device, dtype, normalize=False)
+    fixed_full = ants_image_to_tensor(fixed, resolved_device, dtype, normalize=False)
+    warpedmovout = _sample_output(moving_full, forward_coords, output_interpolator, padding_mode)
+    warpedfixout = _sample_output(fixed_full, inverse_coords, output_interpolator, padding_mode)
+    del moving_full, fixed_full
     if reorientation is not None:
         # Reorient the warped images by the Jacobians of the total pull-back maps.
         warpedmovout = reorientation.reorient_warped(warpedmovout, total_forward, fixed_meta_full)

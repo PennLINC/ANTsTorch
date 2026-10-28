@@ -15,6 +15,8 @@ import torch
 import torch.nn.functional as F
 from ..._torch_compat import grid_sample
 
+_CUBIC_ALIASES = ('cubic', 'catmull_rom', 'catmullRom', 'hermite')
+
 
 def _bspline_weights(u):
     """Cubic B-spline weights of the 4 neighbors ``i-1, i, i+1, i+2`` for the fractional offset ``u``."""
@@ -42,13 +44,19 @@ def _catmull_rom_weights(u):
     return [w0, w1, w2, w3]
 
 
-def _grid_sample_separable_cubic(image, grid, get_w, padding_mode='border', align_corners=True, max_chunk_elements=1 << 25):
+def _grid_sample_separable_cubic(
+    image,
+    grid,
+    get_w,
+    padding_mode='border',
+    align_corners=True,
+    max_chunk_elements=1 << 25,
+):
     """Shared 4-tap separable sampler behind :func:`grid_sample_bspline_torch` and :func:`grid_sample_cubic_torch`.
 
     The per-axis tap indices and weights are computed once; the ``4**ndim`` taps are then gathered and
     accumulated in place, in channel chunks of at most ``max_chunk_elements`` output elements each, so the
-    peak memory stays near one output image plus one chunk however many channels ``image`` has (a 45-channel
-    spherical harmonic volume at 1.25 mm would otherwise need several extra copies per tap).
+    peak memory stays near one output image plus one chunk, however many channels ``image`` has.
     """
     ndim = image.ndim - 2
     if ndim not in (2, 3):
@@ -95,7 +103,8 @@ def _grid_sample_separable_cubic(image, grid, get_w, padding_mode='border', alig
             w = w * valid.unsqueeze(1).to(w.dtype)  # a zero weight for out-of-bounds taps
         for c0 in range(0, C, chunk):
             c1 = min(C, c0 + chunk)
-            sampled = torch.gather(img_flat[:, c0:c1], 2, idx.expand(B, c1 - c0, n_target)).view(B, c1 - c0, *spatial_target)
+            gathered = torch.gather(img_flat[:, c0:c1], 2, idx.expand(B, c1 - c0, n_target))
+            sampled = gathered.view(B, c1 - c0, *spatial_target)
             out[:, c0:c1].addcmul_(w, sampled)
     return out
 
@@ -141,7 +150,9 @@ def grid_sample_bspline_torch(
     ValueError
         If ``image`` is not 2-D or 3-D (excluding batch/channel dims).
     """
-    return _grid_sample_separable_cubic(image, grid, _bspline_weights, padding_mode=padding_mode, align_corners=align_corners)
+    return _grid_sample_separable_cubic(
+        image, grid, _bspline_weights, padding_mode=padding_mode, align_corners=align_corners
+    )
 
 
 def grid_sample_cubic_torch(
@@ -157,8 +168,8 @@ def grid_sample_cubic_torch(
     two, so resampling preserves the image's sharpness far better than
     trilinear interpolation, at the cost of a small overshoot at edges. It is
     the same kernel as MRtrix3's default ``cubic`` interpolation
-    (``mrtransform``, ``mrgrid``), which makes it the sampler of choice for
-    FOD images. ``image`` and ``grid`` follow :func:`grid_sample_bspline_torch`.
+    (``mrtransform``, ``mrgrid``). ``image`` and ``grid`` follow
+    :func:`grid_sample_bspline_torch`.
 
     Parameters
     ----------
@@ -178,7 +189,9 @@ def grid_sample_cubic_torch(
     torch.Tensor
         Sampled image of shape ``(B, C, *grid.shape[1:-1])``.
     """
-    return _grid_sample_separable_cubic(image, grid, _catmull_rom_weights, padding_mode=padding_mode, align_corners=align_corners)
+    return _grid_sample_separable_cubic(
+        image, grid, _catmull_rom_weights, padding_mode=padding_mode, align_corners=align_corners
+    )
 
 
 def _image_spatial_gradient(image):
@@ -250,11 +263,12 @@ class AnalyticalGridSample(torch.autograd.Function):
         return None, grad_grid, None, None, None
 
 
-_CUBIC_ALIASES = ('cubic', 'catmull_rom', 'catmullRom', 'hermite')
-
 
 def grid_sample_nd(input, grid, mode='bilinear', padding_mode='border', align_corners=True, interpolator='linear', use_analytical_gradients=True):
-    """Dispatching wrapper around ``grid_sample``/:func:`grid_sample_bspline_torch`/:func:`grid_sample_cubic_torch`/:class:`AnalyticalGridSample`.
+    """Dispatching wrapper around the grid samplers.
+
+    The backends are ``grid_sample``, :func:`grid_sample_bspline_torch`,
+    :func:`grid_sample_cubic_torch` and :class:`AnalyticalGridSample`.
 
     Parameters
     ----------
@@ -501,19 +515,26 @@ def prepare_mid_images_and_gradients_torch(
 
     grad_I_mid_sampled = grad_J_mid_sampled = None
     if compute_gradients:
-        channels = I_curr.shape[1]
         if grad_I_curr is None:
             # (B, *spatial, C, dim): one spatial gradient per channel; squeezed to (B, *spatial, dim) for C == 1.
-            grad_I_curr = _spatial_jacobian_nd(I_curr.movedim(1, -1), physical_spacing=tuple(reversed(fixed_spacing))).squeeze(-2)
+            grad_I_curr = _spatial_jacobian_nd(
+                I_curr.movedim(1, -1), physical_spacing=tuple(reversed(fixed_spacing))
+            ).squeeze(-2)
         if grad_J_curr is None:
-            grad_J_curr = _spatial_jacobian_nd(J_curr.movedim(1, -1), physical_spacing=tuple(reversed(moving_spacing))).squeeze(-2)
+            grad_J_curr = _spatial_jacobian_nd(
+                J_curr.movedim(1, -1), physical_spacing=tuple(reversed(moving_spacing))
+            ).squeeze(-2)
 
         def _sample_gradient(grad, grid):
             # Flatten the trailing (C, dim) (or (dim,)) axes into channels for sampling, then restore them.
             trailing = grad.shape[1 + dim:]
             flat = grad.reshape(grad.shape[: 1 + dim] + (-1,)).movedim(-1, 1)
-            sampled = grid_sample_nd(flat, grid, padding_mode='border', align_corners=True, interpolator=interpolator, use_analytical_gradients=use_analytical_gradients)
-            return sampled.movedim(1, -1).reshape(sampled.shape[:1] + grid.shape[1:-1] + trailing).contiguous()
+            sampled = grid_sample_nd(
+                flat, grid, padding_mode='border', align_corners=True, interpolator=interpolator,
+                use_analytical_gradients=use_analytical_gradients,
+            )
+            shape = sampled.shape[:1] + grid.shape[1:-1] + trailing
+            return sampled.movedim(1, -1).reshape(shape).contiguous()
 
         grad_I_mid_sampled = _sample_gradient(grad_I_curr, coords_norm)
         grad_I_mid_sampled = torch.matmul(grad_I_mid_sampled, fixed_direction_t.t())
@@ -521,7 +542,6 @@ def prepare_mid_images_and_gradients_torch(
         grad_J_mid_sampled = _sample_gradient(grad_J_curr, y_norm)
         grad_J_mid_sampled = torch.matmul(grad_J_mid_sampled, moving_direction_t.t())
         grad_J_mid_sampled = torch.matmul(grad_J_mid_sampled, M_phys)
-        del channels
 
     mask_I = (coords_norm[..., 0] >= -1.0) & (coords_norm[..., 0] <= 1.0)
     for d in range(1, dim):

@@ -424,10 +424,10 @@ def _two_channel(image):
 def _smooth_warp(reference, amplitude=1.5):
     """A smooth displacement field (vector ANTsImage on ``reference``'s grid, ITK (x, y, z) components)."""
     x, y, z = np.meshgrid(*[np.arange(n, dtype=np.float64) for n in reference.shape], indexing="ij")
-    field = np.stack(
-        [amplitude * np.sin(x / 4.0) * np.cos(y / 5.0), -amplitude * np.cos(z / 3.0), amplitude * np.sin((x + y) / 6.0)],
-        axis=-1,
-    ).astype(np.float32)
+    components = [
+        amplitude * np.sin(x / 4.0) * np.cos(y / 5.0), -amplitude * np.cos(z / 3.0), amplitude * np.sin((x + y) / 6.0),
+    ]
+    field = np.stack(components, axis=-1).astype(np.float32)
     return ants.from_numpy(
         field, origin=reference.origin, spacing=reference.spacing, direction=reference.direction, has_components=True
     )
@@ -450,10 +450,15 @@ class TestTorchTemplateUpdate:
         affine_fn = str(tmp_path / "affine.mat")
         write_affine_transform(torch.as_tensor(matrix), torch.as_tensor([1.0, -2.0, 0.5]), 3, affine_fn)
         inner = (slice(2, -2),) * 3
-        for transforms, invert, w, a in (
-            ([warp_fn, affine_fn], [0, 1], warp, affine_fn), ([warp_fn], [0], warp, None), ([affine_fn], [1], None, affine_fn),
-        ):
-            expected = ants.apply_transforms(fixed=scalar, moving=scalar, transformlist=transforms, whichtoinvert=invert)
+        cases = (
+            ([warp_fn, affine_fn], [0, 1], warp, affine_fn),
+            ([warp_fn], [0], warp, None),
+            ([affine_fn], [1], None, affine_fn),
+        )
+        for transforms, invert, w, a in cases:
+            expected = ants.apply_transforms(
+                fixed=scalar, moving=scalar, transformlist=transforms, whichtoinvert=invert
+            )
             got = _apply_transforms_torch(vector, w, a)
             assert got.components == 2
             np.testing.assert_allclose(got.numpy()[..., 0][inner], expected.numpy()[inner], atol=2e-3)
@@ -492,7 +497,8 @@ class TestTorchTemplateUpdate:
     @pytest.mark.parametrize("interpolator", ["linear", "cubic"])
     def test_resample_vector_onto_identity_and_shifted_grid(self, interpolator):
         image = _two_channel(_blob_3d((10, 11, 12), (5, 5, 6)))
-        np.testing.assert_allclose(_resample_vector_onto(image, image, interpolator=interpolator).numpy(), image.numpy())
+        same = _resample_vector_onto(image, image, interpolator=interpolator)
+        np.testing.assert_allclose(same.numpy(), image.numpy())
         # a copy of the grid (not the same object) still reproduces the voxel values with an interpolating kernel
         copy = image * 0.0
         np.testing.assert_allclose(
@@ -526,7 +532,9 @@ class TestTorchTemplateUpdate:
 
     def test_multicomponent_template_with_sharpening(self, tmp_path):
         images = [_two_channel(_blob_3d((12, 13, 14), c)) for c in ((6, 6, 7), (5, 7, 8), (7, 6, 6))]
-        result = build_template(image_list=images, iterations=1, blending_weight=0.75, output_dir=str(tmp_path), **FAST_3D)
+        result = build_template(
+            image_list=images, iterations=1, blending_weight=0.75, output_dir=str(tmp_path), **FAST_3D
+        )
         assert result["template"].components == 2 and np.isfinite(result["template"].numpy()).all()
         with pytest.raises(ValueError, match="same number of components"):
             build_template(image_list=[images[0], _blob_3d((12, 13, 14), (6, 6, 7))], iterations=1, **FAST_3D)
@@ -558,7 +566,9 @@ class TestMultiContrast:
         assert result["n_iterations"] == 2
         # Extras on a finer grid are resampled onto the primary grid first.
         fine = [_blob_3d((24, 26, 28), tuple(2 * v for v in c), sigma=5.0, spacing=(1.0, 1.0, 1.0)) for c in _CENTERS]
-        fine_result = build_template(image_list=images, extra_contrasts=[fine], iterations=1, blending_weight=1.0, **common)
+        fine_result = build_template(
+            image_list=images, extra_contrasts=[fine], iterations=1, blending_weight=1.0, **common
+        )
         assert tuple(fine_result["extra_templates"][0].shape) == tuple(images[0].shape)
         assert np.allclose(fine_result["extra_templates"][0].spacing, images[0].spacing)
         with pytest.raises(ValueError, match="extra_contrasts\\[0\\]"):
@@ -568,7 +578,8 @@ class TestMultiContrast:
                 image_list=images, extra_contrasts=[extras], extra_contrast_weights=[1.0, 1.0], iterations=1, **common
             )
         with pytest.raises(ValueError, match="scalar"):
-            build_template(image_list=images, extra_contrasts=[[_two_channel(e) for e in extras]], iterations=1, **common)
+            vector_extras = [_two_channel(e) for e in extras]
+            build_template(image_list=images, extra_contrasts=[vector_extras], iterations=1, **common)
 
     def test_without_extra_contrasts_returns_empty_lists(self, tmp_path):
         images = [_blob_3d((10, 10, 10), c) for c in ((5, 5, 5), (4, 5, 6))]
@@ -647,7 +658,9 @@ class TestMultiContrast:
             type_of_transform="Translation", initial_alignment="Translation", affine_iterations=(40, 40, 40),
             affine_multi_start=False, iterations=1, blending_weight=1.0,
         )
-        gathered = build_template(image_list=images, output_dir=str(tmp_path / "ref"), initial_alignment_reference=0, **common)
+        gathered = build_template(
+            image_list=images, output_dir=str(tmp_path / "ref"), initial_alignment_reference=0, **common
+        )
         # Against the ghosted average each input starts on top of its own ghost and stays there (a
         # center-of-mass start would drop identical blobs onto the saddle between the ghosts instead).
         ghosted = build_template(
