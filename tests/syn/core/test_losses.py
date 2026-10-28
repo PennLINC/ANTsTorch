@@ -251,3 +251,18 @@ def test_soft_dice_loss_nd_is_differentiable_and_respects_mask():
     assert torch.isfinite(moving.grad).all()
     # Masked-out region should receive zero gradient.
     assert torch.all(moving.grad[:, :, :4] == 0.0)
+
+
+def test_local_ncc_loss_nd_joint_channels_reduces_to_lncc_for_one_channel():
+    torch.manual_seed(0)
+    I = torch.rand(1, 1, 9, 10, 11)
+    J = torch.rand(1, 1, 9, 10, 11)
+    assert torch.allclose(local_ncc_loss_nd(I, J, window_size=3), local_ncc_loss_nd(I, J, window_size=3, joint_channels=True))
+    I3 = torch.cat([I, 0.01 * torch.rand(1, 2, 9, 10, 11)], dim=1)
+    J3 = torch.cat([J, 0.01 * torch.rand(1, 2, 9, 10, 11)], dim=1)
+    per_channel = local_ncc_loss_nd(I3, J3, window_size=3)
+    joint = local_ncc_loss_nd(I3, J3, window_size=3, joint_channels=True)
+    assert not torch.allclose(per_channel, joint)
+    assert -1.0 <= float(joint) <= 0.0
+    with pytest.raises(ValueError):
+        local_ncc_loss_nd(I3, J3, window_size=3, joint_channels=True, use_ants_pseudo_gradient=True)

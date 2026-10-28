@@ -8,12 +8,17 @@ import os
 import ants
 import numpy as np
 import pytest
+import torch
 
+from antstorch.ants_transform_io import write_affine_transform
 from antstorch.syn import build_template
 from antstorch.syn.template import (
+    _apply_transforms_torch,
     _compute_shape_residual,
     _initial_template,
     _normalize_weights,
+    _resample_vector_onto,
+    _sharpen_image,
     _template_change,
 )
 
@@ -385,3 +390,274 @@ def test_vector_fallback_runs_without_ants_vector_support(tmp_path, monkeypatch)
     out = tmod._apply_affine_to_vectors(fixed, moving, fn, invert=True)
     assert out.components == 2 and out.shape == moving.shape
     assert np.isfinite(out.numpy()).all()
+
+
+# ---------------------------------------------------------------------------
+# torch template update (multi-component images, non-linear interpolators)
+# ---------------------------------------------------------------------------
+
+_DIRECTION = np.diag([-1.0, -1.0, 1.0])
+FAST_3D = dict(levels=(2, 1), reg_iterations=(3, 2), affine_iterations=(10, 10, 10), affine_multi_start=False)
+
+
+def _blob_3d(shape, center, sigma=3.0, spacing=(2.0, 2.0, 2.0), origin=(-20.0, -18.0, 5.0)):
+    """A scalar Gaussian blob plus a smaller satellite (asymmetric, so the affine cannot land on a reflection)."""
+    zz, yy, xx = np.mgrid[0 : shape[0], 0 : shape[1], 0 : shape[2]].astype(np.float64)
+
+    def gaussian(c, s):
+        return np.exp(-(((zz - c[0]) ** 2 + (yy - c[1]) ** 2 + (xx - c[2]) ** 2) / (2.0 * s**2)))
+
+    satellite = tuple(c + o for c, o in zip(center, (2.5, -2.0, 1.5)))
+    array = gaussian(center, sigma) + 0.6 * gaussian(satellite, sigma / 2.0)
+    array = np.ascontiguousarray(np.transpose(array, (2, 1, 0)).astype(np.float32))
+    return ants.from_numpy(array, origin=origin, spacing=spacing, direction=_DIRECTION)
+
+
+def _two_channel(image):
+    array = image.numpy()
+    return ants.from_numpy(
+        np.ascontiguousarray(np.stack([array, 0.5 * array], axis=-1)), origin=image.origin, spacing=image.spacing,
+        direction=image.direction, has_components=True,
+    )
+
+
+def _smooth_warp(reference, amplitude=1.5):
+    """A smooth displacement field (vector ANTsImage on ``reference``'s grid, ITK (x, y, z) components)."""
+    x, y, z = np.meshgrid(*[np.arange(n, dtype=np.float64) for n in reference.shape], indexing="ij")
+    field = np.stack(
+        [amplitude * np.sin(x / 4.0) * np.cos(y / 5.0), -amplitude * np.cos(z / 3.0), amplitude * np.sin((x + y) / 6.0)],
+        axis=-1,
+    ).astype(np.float32)
+    return ants.from_numpy(
+        field, origin=reference.origin, spacing=reference.spacing, direction=reference.direction, has_components=True
+    )
+
+
+class TestTorchTemplateUpdate:
+    def test_matches_ants_apply_transforms(self, tmp_path):
+        rng = np.random.default_rng(0)
+        scalar = _blob_3d((14, 15, 16), (7, 8, 7)) + ants.from_numpy(
+            rng.random((16, 15, 14), dtype=np.float32) * 0.1, origin=(-20.0, -18.0, 5.0), spacing=(2.0, 2.0, 2.0),
+            direction=_DIRECTION,
+        )
+        # ANTsPy has no 1-component vector image; duplicate the scalar into two channels.
+        vector = _two_channel(scalar)
+        warp = _smooth_warp(scalar)
+        warp_fn = str(tmp_path / "warp.nii.gz")
+        ants.image_write(warp, warp_fn)
+        angle = np.radians(8.0)
+        matrix = np.array([[np.cos(angle), -np.sin(angle), 0.0], [np.sin(angle), np.cos(angle), 0.0], [0.0, 0.0, 1.05]])
+        affine_fn = str(tmp_path / "affine.mat")
+        write_affine_transform(torch.as_tensor(matrix), torch.as_tensor([1.0, -2.0, 0.5]), 3, affine_fn)
+        inner = (slice(2, -2),) * 3
+        for transforms, invert, w, a in (
+            ([warp_fn, affine_fn], [0, 1], warp, affine_fn), ([warp_fn], [0], warp, None), ([affine_fn], [1], None, affine_fn),
+        ):
+            expected = ants.apply_transforms(fixed=scalar, moving=scalar, transformlist=transforms, whichtoinvert=invert)
+            got = _apply_transforms_torch(vector, w, a)
+            assert got.components == 2
+            np.testing.assert_allclose(got.numpy()[..., 0][inner], expected.numpy()[inner], atol=2e-3)
+            np.testing.assert_allclose(got.numpy()[..., 1][inner], 0.5 * expected.numpy()[inner], atol=2e-3)
+
+    def test_identity_and_one_voxel_shift(self, tmp_path):
+        rng = np.random.default_rng(1)
+        scalar = ants.from_numpy(
+            np.ascontiguousarray(rng.random((12, 11, 10), dtype=np.float32)), origin=(-20.0, -18.0, 5.0),
+            spacing=(2.0, 2.0, 2.0), direction=_DIRECTION,
+        )
+        identity_fn = str(tmp_path / "identity.mat")
+        write_affine_transform(torch.eye(3, dtype=torch.float64), torch.zeros(3, dtype=torch.float64), 3, identity_fn)
+        zero_warp = _smooth_warp(scalar, amplitude=0.0)
+        for interpolator in ("linear", "cubic", "nearest"):
+            got = _apply_transforms_torch(scalar, zero_warp, identity_fn, interpolator)
+            np.testing.assert_allclose(got.numpy(), scalar.numpy(), atol=1e-5)
+        # the approximating B-spline does not reproduce the voxel values
+        bspline = _apply_transforms_torch(scalar, zero_warp, identity_fn, "bspline").numpy()
+        assert np.abs(bspline - scalar.numpy()).max() > 1e-2
+        # a translation by one voxel is exact for an interpolating kernel (away from the borders)
+        shift_fn = str(tmp_path / "shift.mat")
+        write_affine_transform(torch.eye(3, dtype=torch.float64), torch.tensor([-2.0, 0.0, 0.0]), 3, shift_fn)
+        got = _apply_transforms_torch(scalar, None, shift_fn, "cubic").numpy()
+        np.testing.assert_allclose(got[1:, :, :], scalar.numpy()[:-1, :, :], atol=1e-5)
+
+    def test_sharpen_image_is_per_channel(self):
+        image = _two_channel(_blob_3d((10, 11, 12), (5, 5, 6)))
+        out = _sharpen_image(image, 0.75)
+        assert out.components == 2 and tuple(out.shape) == tuple(image.shape)
+        channel = ants.split_channels(image)[0]
+        expected = channel * 0.75 + ants.iMath(channel, "Sharpen") * 0.25
+        np.testing.assert_allclose(out.numpy()[..., 0], expected.numpy(), atol=1e-5)
+        np.testing.assert_allclose(np.asarray(out.direction), np.asarray(image.direction))
+
+    @pytest.mark.parametrize("interpolator", ["linear", "cubic"])
+    def test_resample_vector_onto_identity_and_shifted_grid(self, interpolator):
+        image = _two_channel(_blob_3d((10, 11, 12), (5, 5, 6)))
+        np.testing.assert_allclose(_resample_vector_onto(image, image, interpolator=interpolator).numpy(), image.numpy())
+        # a copy of the grid (not the same object) still reproduces the voxel values with an interpolating kernel
+        copy = image * 0.0
+        np.testing.assert_allclose(
+            _resample_vector_onto(image, copy, interpolator=interpolator).numpy(), image.numpy(), atol=1e-5
+        )
+        shifted = _two_channel(_blob_3d((10, 11, 12), (5, 5, 6), origin=(-19.0, -17.0, 6.0)))
+        out = _resample_vector_onto(image, shifted, interpolator=interpolator)
+        inner = (slice(1, -1),) * 3
+        if interpolator == "cubic":
+            # The target grid's origin is 1 mm further along each LPS axis, half a voxel: the blob
+            # (centered in (z, y, x) index order) moves to (cz - 0.5, cy + 0.5, cx + 0.5).
+            truth = _two_channel(_blob_3d((10, 11, 12), (4.5, 5.5, 6.5))).numpy()
+            linear = _resample_vector_onto(image, shifted, interpolator="linear").numpy()
+            assert np.abs(out.numpy() - truth)[inner].mean() < np.abs(linear - truth)[inner].mean()
+            return
+        expected = ants.resample_image_to_target(
+            ants.split_channels(image)[0], ants.split_channels(shifted)[0], interp_type="linear"
+        ).numpy()
+        np.testing.assert_allclose(out.numpy()[..., 0][inner], expected[inner], atol=1e-4)
+
+    def test_cubic_scalar_template(self, tmp_path):
+        images = [_blob_3d((12, 13, 14), c) for c in ((6, 6, 7), (5, 7, 8), (7, 6, 6))]
+        result = build_template(
+            image_list=images, iterations=1, blending_weight=1.0, output_dir=str(tmp_path), output_interpolator="cubic",
+            **FAST_3D,
+        )
+        assert result["template"].components == 1 and np.isfinite(result["template"].numpy()).all()
+        assert tuple(result["template"].shape) == tuple(images[0].shape)
+        with pytest.raises(ValueError, match="output_interpolator"):
+            build_template(image_list=images, iterations=1, output_interpolator="sinc", **FAST_3D)
+
+    def test_multicomponent_template_with_sharpening(self, tmp_path):
+        images = [_two_channel(_blob_3d((12, 13, 14), c)) for c in ((6, 6, 7), (5, 7, 8), (7, 6, 6))]
+        result = build_template(image_list=images, iterations=1, blending_weight=0.75, output_dir=str(tmp_path), **FAST_3D)
+        assert result["template"].components == 2 and np.isfinite(result["template"].numpy()).all()
+        with pytest.raises(ValueError, match="same number of components"):
+            build_template(image_list=[images[0], _blob_3d((12, 13, 14), (6, 6, 7))], iterations=1, **FAST_3D)
+
+
+# ---------------------------------------------------------------------------
+# extra contrasts, continued builds, linear pre-alignment
+# ---------------------------------------------------------------------------
+
+_CENTERS = ((6, 6, 7), (5, 7, 8), (7, 6, 6))
+
+
+class TestMultiContrast:
+    def test_extra_contrast(self, tmp_path):
+        images = [_blob_3d((12, 13, 14), c) for c in _CENTERS]
+        extras = [_blob_3d((12, 13, 14), c, sigma=2.5) * 3.0 for c in _CENTERS]
+        common = dict(output_dir=str(tmp_path), **FAST_3D)
+        result = build_template(
+            image_list=images, extra_contrasts=[extras], extra_contrast_weights=[0.5], iterations=2,
+            blending_weight=0.75, **common,
+        )
+        assert len(result["extra_templates"]) == 1
+        extra_template = result["extra_templates"][0]
+        assert extra_template.components == 1 and tuple(extra_template.shape) == tuple(images[0].shape)
+        assert np.allclose(extra_template.spacing, images[0].spacing) and np.isfinite(extra_template.numpy()).all()
+        # The extra template is an average of the warped extras: its peak sits between the inputs' peaks.
+        assert 0.5 * 3.0 < extra_template.numpy().max() <= 3.0 * 1.6 * 1.05
+        assert len(result["warped_extra_images"]) == 1 and len(result["warped_extra_images"][0]) == 3
+        assert result["n_iterations"] == 2
+        # Extras on a finer grid are resampled onto the primary grid first.
+        fine = [_blob_3d((24, 26, 28), tuple(2 * v for v in c), sigma=5.0, spacing=(1.0, 1.0, 1.0)) for c in _CENTERS]
+        fine_result = build_template(image_list=images, extra_contrasts=[fine], iterations=1, blending_weight=1.0, **common)
+        assert tuple(fine_result["extra_templates"][0].shape) == tuple(images[0].shape)
+        assert np.allclose(fine_result["extra_templates"][0].spacing, images[0].spacing)
+        with pytest.raises(ValueError, match="extra_contrasts\\[0\\]"):
+            build_template(image_list=images, extra_contrasts=[extras[:2]], iterations=1, **common)
+        with pytest.raises(ValueError, match="extra_contrast_weights"):
+            build_template(
+                image_list=images, extra_contrasts=[extras], extra_contrast_weights=[1.0, 1.0], iterations=1, **common
+            )
+        with pytest.raises(ValueError, match="scalar"):
+            build_template(image_list=images, extra_contrasts=[[_two_channel(e) for e in extras]], iterations=1, **common)
+
+    def test_without_extra_contrasts_returns_empty_lists(self, tmp_path):
+        images = [_blob_3d((10, 10, 10), c) for c in ((5, 5, 5), (4, 5, 6))]
+        result = build_template(
+            image_list=images, iterations=1, output_dir=str(tmp_path), type_of_transform="SyNOnly", levels=(1,),
+            reg_iterations=(1,),
+        )
+        assert result["extra_templates"] == [] and result["warped_extra_images"] == []
+
+    def test_continues_from_previous_templates(self, tmp_path):
+        images = [_blob_3d((12, 13, 14), c) for c in _CENTERS]
+        extras = [_blob_3d((12, 13, 14), c, sigma=2.5) * 3.0 for c in _CENTERS]
+        common = dict(extra_contrasts=[extras], iterations=1, blending_weight=1.0, **FAST_3D)
+        first = build_template(image_list=images, output_dir=str(tmp_path / "first"), **common)
+        second = build_template(
+            image_list=images, output_dir=str(tmp_path / "second"), initial_template=first["template"],
+            initial_extra_templates=first["extra_templates"], **common,
+        )
+        extra_template = second["extra_templates"][0]
+        assert second["n_iterations"] == 1 and extra_template.components == 1
+        assert np.isfinite(extra_template.numpy()).all()
+        # One more iteration refines the extra template rather than restarting from scratch.
+        assert np.abs(extra_template.numpy() - first["extra_templates"][0].numpy()).max() < 0.5 * 3.0
+        with pytest.raises(ValueError, match="initial_extra_templates must hold one image per extra contrast"):
+            build_template(
+                image_list=images, output_dir=str(tmp_path / "bad"), initial_template=first["template"],
+                initial_extra_templates=[], **common,
+            )
+
+    def test_initial_alignment_starts_from_aligned_inputs(self, tmp_path):
+        centers = ((6, 6, 7), (4, 7, 8), (8, 6, 6))
+        images = [_blob_3d((12, 13, 14), c) for c in centers]
+        extras = [_blob_3d((12, 13, 14), c, sigma=2.5) * 3.0 for c in centers]
+        common = dict(blending_weight=1.0, iterations=1, **dict(FAST_3D, reg_iterations=(2, 2)))
+        res = build_template(
+            image_list=images, extra_contrasts=[extras], output_dir=str(tmp_path / "aligned"),
+            initial_alignment="Rigid", initial_alignment_iterations=2, **common,
+        )
+        pre = res["initial_alignment"]
+        assert pre is not None and pre["reference"] == "image 0" and res["n_iterations"] == 1
+        # Pass 1 targets image 0, pass 2 the running average.
+        assert [r["n_iterations"] for r in pre["passes"]] == [1, 1]
+        for name in ("initial_rigid_reference", "initial_rigid"):
+            assert os.path.isfile(os.path.join(tmp_path, "aligned", name, "iter00_img0000", "out0GenericAffine.mat"))
+        assert np.isfinite(res["template"].numpy()).all() and np.isfinite(res["extra_templates"][0].numpy()).all()
+        # Rigidly aligning the blobs before averaging gives a sharper starting template than the plain average.
+        plain = np.mean([e.numpy() for e in extras], axis=0)
+        assert pre["extra_templates"][0].numpy().max() > plain.max() + 0.1 * 3.0
+        # A supplied initial template skips the pre-alignment.
+        again = build_template(
+            image_list=images, extra_contrasts=[extras], output_dir=str(tmp_path / "given"), initial_alignment="Rigid",
+            initial_template=res["template"], initial_extra_templates=res["extra_templates"], **common,
+        )
+        assert again["initial_alignment"] is None
+        with pytest.raises(ValueError, match="initial_alignment must be one of"):
+            build_template(image_list=images, initial_alignment="SyN", **common)
+        with pytest.raises(ValueError, match="not an index into image_list"):
+            build_template(image_list=images, initial_alignment="Rigid", initial_alignment_reference=3, **common)
+        with pytest.raises(ValueError, match="must be a sequence"):
+            build_template(
+                image_list=images, extra_contrasts=[extras], initial_alignment="Rigid",
+                initial_alignment_reference=images[1], **common,
+            )
+
+    def test_initial_alignment_reference_image_breaks_ghosts_in_the_average(self, tmp_path):
+        # Two subsets of inputs that already share a pose, 8 voxels apart: the plain average shows two ghosts,
+        # and a first pass against that average leaves the inputs split between them; a first pass against one
+        # input gathers everything.
+        def blob(center, shape=(16, 12, 12), sigma=1.5):
+            grid = np.indices(shape, dtype=np.float32)
+            array = np.exp(-sum((g - c) ** 2 for g, c in zip(grid, center)) / (2.0 * sigma**2))
+            return ants.from_numpy(np.ascontiguousarray(array))
+
+        images = [blob(c) for c in ((4, 6, 6), (4, 6, 6), (12, 6, 6), (12, 6, 6))]
+        common = dict(
+            type_of_transform="Translation", initial_alignment="Translation", affine_iterations=(40, 40, 40),
+            affine_multi_start=False, iterations=1, blending_weight=1.0,
+        )
+        gathered = build_template(image_list=images, output_dir=str(tmp_path / "ref"), initial_alignment_reference=0, **common)
+        # Against the ghosted average each input starts on top of its own ghost and stays there (a
+        # center-of-mass start would drop identical blobs onto the saddle between the ghosts instead).
+        ghosted = build_template(
+            image_list=images, output_dir=str(tmp_path / "avg"), initial_alignment_reference=None,
+            affine_center_of_mass_init=False, **common,
+        )
+        assert gathered["initial_alignment"]["reference"] == "image 0"
+        assert ghosted["initial_alignment"]["reference"] == "the average of the unaligned inputs"
+        assert gathered["initial_alignment"]["template"].numpy().max() > 0.85
+        assert ghosted["initial_alignment"]["template"].numpy().max() < 0.7
+        # The gathered template sits at the group's mean pose (between the two subsets), not on the reference.
+        peak = np.unravel_index(gathered["initial_alignment"]["template"].numpy().argmax(), (16, 12, 12))
+        assert 6 <= peak[0] <= 10

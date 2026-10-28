@@ -983,3 +983,177 @@ def test_reg_adam_optimizer_works_in_3d():
         regularizer="dsti", optimizer="reg_adam",
     )
     assert torch.isfinite(torch.tensor(result["loss_history"])).all()
+
+
+# --- Multi-component images and extra contrasts -------------------------------
+
+
+def _gaussian_3d(center, shape=(16, 16, 16), sigma=2.5, spacing=(1.0, 1.0, 1.0)):
+    grid = np.indices(shape, dtype=np.float32)
+    array = np.exp(-sum((g - c) ** 2 for g, c in zip(grid, center)) / (2.0 * sigma**2))
+    return ants.from_numpy(np.ascontiguousarray(array), spacing=spacing)
+
+
+def _two_channel(image):
+    """A blob and a dimmer copy of it as a 2-component image."""
+    array = image.numpy()
+    stacked = np.ascontiguousarray(np.stack([array, 0.5 * array], axis=-1))
+    return ants.from_numpy(stacked, origin=image.origin, spacing=image.spacing, direction=image.direction, has_components=True)
+
+
+def test_syn_registration_rejects_mismatched_components():
+    fixed, moving = _ants_pair_3d()
+    with pytest.raises(ValueError, match="same number of components"):
+        syn_registration(_two_channel(fixed), moving, type_of_transform="SyNOnly", levels=(1,), reg_iterations=(1,))
+
+
+def test_syn_registration_multicomponent_uses_one_shared_scale():
+    fixed, moving = _two_channel(_gaussian_3d((8, 8, 8))), _two_channel(_gaussian_3d((7, 8, 9)))
+    kw = dict(type_of_transform="SyNOnly", syn_metric="lncc_joint", levels=(2, 1), reg_iterations=(4, 3))
+    result = syn_registration(fixed, moving, **kw)
+    scaled = syn_registration(fixed * 10.0, moving * 10.0, **kw)
+    warp = ants.image_read(result["fwdtransforms"][0]).numpy()
+    assert np.abs(warp).max() > 0.1
+    np.testing.assert_allclose(ants.image_read(scaled["fwdtransforms"][0]).numpy(), warp, atol=1e-5)
+    assert result["warpedmovout"].components == 2 and result["provenance"]["reorientation"] is None
+
+
+def test_syn_registration_output_interpolator_default_and_cubic():
+    fixed, moving = _two_channel(_gaussian_3d((8, 8, 8))), _two_channel(_gaussian_3d((7, 8, 9)))
+    kw = dict(type_of_transform="SyNOnly", levels=(1,), reg_iterations=(2,))
+    linear = syn_registration(fixed, moving, **kw)
+    assert linear["provenance"]["output_interpolator"] == "linear"
+    cubic = syn_registration(fixed, moving, output_interpolator="cubic", **kw)
+    assert cubic["warpedmovout"].components == 2
+    difference = np.abs(cubic["warpedmovout"].numpy() - linear["warpedmovout"].numpy())
+    assert np.isfinite(cubic["warpedmovout"].numpy()).all() and difference.max() > 1e-4
+    # the same warp drives both outputs, so they agree where the image is smooth
+    assert difference.mean() < 0.1 * np.abs(linear["warpedmovout"].numpy()).mean()
+    with pytest.raises(ValueError, match="output_interpolator"):
+        syn_registration(fixed, moving, output_interpolator="sinc", **kw)
+    with pytest.raises(ValueError, match="padding_mode"):
+        syn_registration(fixed, moving, output_interpolator="cubic", padding_mode="reflection", **kw)
+
+
+def test_extra_contrast_validation():
+    fixed, moving = _ants_pair_3d()
+    kw = dict(type_of_transform="SyNOnly", levels=(1,), reg_iterations=(1,))
+    with pytest.raises(ValueError, match="extra_contrast_weights"):
+        syn_registration(fixed, moving, extra_contrasts=[(fixed, moving)], extra_contrast_weights=[1.0, 2.0], **kw)
+    with pytest.raises(ValueError, match="non-negative"):
+        syn_registration(fixed, moving, extra_contrasts=[(fixed, moving)], extra_contrast_weights=[-1.0], **kw)
+    with pytest.raises(ValueError, match="scalar"):
+        syn_registration(fixed, moving, extra_contrasts=[(_two_channel(fixed), _two_channel(moving))], **kw)
+    with pytest.raises(ValueError, match="pair"):
+        syn_registration(fixed, moving, extra_contrasts=[(fixed,)], **kw)
+
+
+def test_extra_contrast_drives_the_registration_where_the_primary_carries_no_information():
+    primary = _gaussian_3d((8, 8, 8), sigma=4.0)
+    extra_fixed, extra_moving = _gaussian_3d((8, 8, 8)), _gaussian_3d((7, 8, 9))
+    kw = dict(type_of_transform="SyNOnly", syn_metric="lncc_joint", levels=(2, 1), reg_iterations=(8, 6))
+    plain = syn_registration(primary, primary, **kw)
+    assert np.abs(ants.image_read(plain["fwdtransforms"][0]).numpy()).max() < 1e-4
+    assert plain["warpedmovout_extras"] == [] and plain["warpedfixout_extras"] == []
+    result = syn_registration(primary, primary, extra_contrasts=[(extra_fixed, extra_moving)], **kw)
+    warped = result["warpedmovout_extras"][0]
+    before = np.mean((extra_moving.numpy() - extra_fixed.numpy()) ** 2)
+    after = np.mean((warped.numpy() - extra_fixed.numpy()) ** 2)
+    assert after < 0.5 * before
+    assert warped.components == 1 and tuple(warped.shape) == tuple(primary.shape)
+    assert len(result["warpedfixout_extras"]) == 1
+    assert result["provenance"]["n_extra_contrasts"] == 1 and result["provenance"]["extra_contrast_weights"] == (1.0,)
+
+
+def test_extra_contrast_with_zero_weight_reproduces_the_single_contrast_registration():
+    fixed, moving = _gaussian_3d((8, 8, 8)), _gaussian_3d((7, 8, 9))
+    extra_fixed, extra_moving = _gaussian_3d((8, 8, 8), sigma=1.5), _gaussian_3d((6, 8, 10), sigma=1.5)
+    kw = dict(type_of_transform="SyNOnly", syn_metric="mse", levels=(2, 1), reg_iterations=(4, 3))
+    single = syn_registration(fixed, moving, **kw)
+    weighted = syn_registration(
+        fixed, moving, extra_contrasts=[(extra_fixed, extra_moving)], extra_contrast_weights=[0.0], **kw
+    )
+    np.testing.assert_allclose(
+        ants.image_read(weighted["fwdtransforms"][0]).numpy(), ants.image_read(single["fwdtransforms"][0]).numpy(),
+        atol=1e-5,
+    )
+    np.testing.assert_allclose(weighted["warpedmovout"].numpy(), single["warpedmovout"].numpy(), atol=1e-5)
+
+
+def test_extra_contrast_on_another_grid_is_resampled_for_syn_and_linear_registrations():
+    fixed = _gaussian_3d((6, 6, 6), shape=(12, 12, 12), spacing=(2.0, 2.0, 2.0))
+    moving = _gaussian_3d((5, 6, 7), shape=(12, 12, 12), spacing=(2.0, 2.0, 2.0))
+    # The same field of view sampled at 1 mm instead of 2 mm.
+    fine_fixed = _gaussian_3d((12, 12, 12), shape=(24, 24, 24), sigma=5.0)
+    fine_moving = _gaussian_3d((10, 12, 14), shape=(24, 24, 24), sigma=5.0)
+    result = syn_registration(
+        fixed, moving, type_of_transform="SyNOnly", levels=(2, 1), reg_iterations=(3, 2),
+        extra_contrasts=[(fine_fixed, fine_moving)], extra_contrast_weights=[0.5],
+    )
+    out = result["warpedmovout_extras"][0]
+    assert tuple(out.shape) == tuple(fixed.shape)
+    assert np.allclose(out.spacing, fixed.spacing) and np.allclose(out.origin, fixed.origin)
+    assert result["provenance"]["extra_contrast_weights"] == (0.5,) and np.isfinite(out.numpy()).all()
+    linear = syn_registration(
+        fixed, moving, type_of_transform="Affine", affine_iterations=(3, 3, 3), affine_multi_start=False,
+        extra_contrasts=[(fine_fixed, fine_moving)],
+    )
+    assert len(linear["warpedmovout_extras"]) == 1
+    assert tuple(linear["warpedmovout_extras"][0].shape) == tuple(fixed.shape)
+    assert linear["provenance"]["n_extra_contrasts"] == 1
+
+
+# --- Extra contrasts in the affine fit ----------------------------------------
+
+
+def _translation_fit(affine_extra_contrasts):
+    # The primary images agree (a broad centered blob), only the extra contrast is shifted: an affine
+    # fit that reads the extra contrast moves, one that reads the primary alone stays put.
+    primary = _gaussian_3d((8, 8, 8), sigma=4.0)
+    extra_fixed = _gaussian_3d((8, 8, 8), sigma=1.5)
+    extra_moving = _gaussian_3d((8, 8, 11), sigma=1.5)
+    result = syn_registration(
+        primary, primary, type_of_transform="Translation", extra_contrasts=[(extra_fixed, extra_moving)],
+        affine_extra_contrasts=affine_extra_contrasts, affine_multi_start=False,
+    )
+    return result["affine_translation"].numpy()
+
+
+def test_extra_contrasts_drive_the_affine_fit_by_default():
+    assert np.abs(_translation_fit(True)).max() > 1.0
+
+
+def test_extra_contrasts_can_be_kept_out_of_the_affine_fit():
+    assert np.abs(_translation_fit(False)).max() < 0.2
+
+
+def test_syn_with_extra_contrasts_still_runs_through_the_joint_affine():
+    extra_fixed = _gaussian_3d((8, 8, 8), sigma=1.5)
+    extra_moving = _gaussian_3d((8, 8, 9), sigma=1.5)
+    result = syn_registration(
+        _gaussian_3d((8, 8, 8)), _gaussian_3d((8, 8, 9)), type_of_transform="SyN",
+        extra_contrasts=[(extra_fixed, extra_moving)], syn_metric="mse", levels=(1,), reg_iterations=(2,),
+        affine_multi_start=False,
+    )
+    assert result["affine_matrix"].shape == (3, 3)
+    assert len(result["warpedmovout_extras"]) == 1
+    assert np.isfinite(result["warpedmovout_extras"][0].numpy()).all()
+
+
+# --- total_sigma units ----------------------------------------------------------
+
+
+@pytest.mark.parametrize("spacing", [2.0, 0.5])
+def test_total_sigma_in_voxel_mode_equals_physical_mode_scaled_by_spacing(spacing):
+    fixed = _gaussian_3d((7, 7, 7), shape=(14, 14, 14), spacing=(spacing,) * 3)
+    moving = _gaussian_3d((6, 7, 8), shape=(14, 14, 14), spacing=(spacing,) * 3)
+    kw = dict(type_of_transform="SyNOnly", syn_metric="mse", levels=(1,), reg_iterations=(6,), grad_step=0.2)
+    voxel = syn_registration(fixed, moving, flow_sigma=1.5, total_sigma=1.0, gaussian_sigma_mode="voxel", **kw)
+    physical = syn_registration(
+        fixed, moving, flow_sigma=1.5 * spacing, total_sigma=1.0 * spacing, gaussian_sigma_mode="physical", **kw
+    )
+    stiffer = syn_registration(fixed, moving, flow_sigma=1.5, total_sigma=2.0, gaussian_sigma_mode="voxel", **kw)
+    warp_voxel = ants.image_read(voxel["fwdtransforms"][0]).numpy()
+    assert np.abs(warp_voxel).max() > 0.05 * spacing
+    np.testing.assert_allclose(warp_voxel, ants.image_read(physical["fwdtransforms"][0]).numpy(), atol=1e-5)
+    assert not np.allclose(warp_voxel, ants.image_read(stiffer["fwdtransforms"][0]).numpy(), atol=1e-3)

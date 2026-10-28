@@ -46,7 +46,7 @@ regularization are relied on for stability instead.
 
 import math
 import warnings
-from typing import Dict, Optional, Sequence, Tuple, Union
+from typing import Callable, Dict, Optional, Sequence, Tuple, Union
 
 import ants
 import numpy as np
@@ -57,6 +57,7 @@ from torch import Tensor
 from ..ants_transform_io import build_transform_lists, default_outprefix, write_affine_transform
 from ..registration import reg_adam_direction
 from .bridge import (
+    _same_grid,
     ants_image_metadata,
     ants_image_to_tensor,
     apply_bspline_smoothing_operator,
@@ -76,7 +77,6 @@ from .core.grid import (
 from .core.inverse import update_inverse_field_nd
 from .core.jacobian import compute_jacobian_determinant_nd
 from .core.losses import local_ncc_loss_nd, mattes_mi_loss_nd, box_cc2_loss_nd, soft_dice_loss_nd
-from .fod import FODRegistration, default_fod_lmax, sh_lmax_of_image
 from .core.pipeline import auto_detect_device, mps_grid_sample_3d_available, mps_grid_sample_3d_forward_available
 from .core.smoothing import (
     apply_dsti_green_operator,
@@ -92,6 +92,7 @@ _SIMILARITY_METRICS = (
     "mattes", "mi", "box_cc2", "dice",
 )
 _REGULARIZERS = ("gaussian", "sobolev", "dsti", "bspline")
+_OUTPUT_INTERPOLATORS = ("linear", "cubic", "bspline", "nearest")
 # 'gradient_descent' (default): the existing CFL-bounded plain-gradient
 # Eulerian update. 'reg_adam': ported from syntx's greedy.py
 # GreedyRegistration.fit() -- per-voxel first/second Adam moments are
@@ -411,18 +412,6 @@ def _compose_fixed_grid(first: Tensor, second: Tensor, X_phys: Tensor, meta_t: D
     return first + sampled.movedim(1, -1)
 
 
-_OUTPUT_INTERPOLATORS = ("linear", "cubic", "bspline", "nearest")
-
-
-def _same_grid(image, reference) -> bool:
-    """Whether two ``ants.ANTsImage`` share shape, spacing, origin and direction."""
-    return (
-        tuple(image.shape) == tuple(reference.shape)
-        and np.allclose(image.spacing, reference.spacing)
-        and np.allclose(image.origin, reference.origin)
-        and np.allclose(np.asarray(image.direction), np.asarray(reference.direction))
-    )
-
 
 def _resample_scalar_onto(image, reference):
     """``image`` on ``reference``'s grid (linear interpolation); ``image`` itself when it is already there."""
@@ -464,12 +453,25 @@ def _prepare_extra_contrasts(fixed, moving, extra_contrasts, extra_contrast_weig
     return pairs, weights
 
 
-def _extra_contrast_tensors(pairs, weights, scale_from_fixed: bool, device, dtype):
+def _shared_intensity_scale(image: Tensor, percentile: float = 99.0) -> float:
+    """``1 / percentile`` of the positive values of channel 0, one factor for every channel of both images."""
+    channel = image[:, 0]
+    positive = channel[channel > 0].detach()
+    if positive.numel() == 0:
+        return 1.0
+    if positive.numel() > 4_000_000:
+        index = torch.randint(0, positive.numel(), (4_000_000,), device=positive.device)
+        positive = positive[index]
+    value = float(torch.quantile(positive.float(), percentile / 100.0))
+    return 1.0 / value if value > 0 else 1.0
+
+
+def _extra_contrast_tensors(pairs, weights, shared_scale: bool, device, dtype):
     """Channel tensors ``(1, n_extra, *spatial)`` of the fixed and moving extra contrasts, normalized and weighted.
 
-    With ``scale_from_fixed`` (the FOD convention) both images of a contrast are scaled by one
-    factor, ``1 / the 99th percentile of the fixed image's positive values``; otherwise each
-    image gets :func:`ants_image_to_tensor`'s per-image percentile normalization. A weight ``w``
+    With ``shared_scale`` (multi-component primary images) both images of a contrast are scaled
+    by one factor, ``1 / the 99th percentile of the fixed image's positive values``; otherwise
+    each image gets :func:`ants_image_to_tensor`'s per-image percentile normalization. A weight ``w``
     multiplies the channel by ``sqrt(w)``, so the contrast's window moments (``'lncc_joint'``) or
     squared differences (``'mse'``) enter the similarity scaled by ``w``. Returns ``(None, None)``
     without extra contrasts.
@@ -478,10 +480,10 @@ def _extra_contrast_tensors(pairs, weights, scale_from_fixed: bool, device, dtyp
         return None, None
     fixed_channels, moving_channels = [], []
     for (fixed_extra, moving_extra), weight in zip(pairs, weights):
-        if scale_from_fixed:
+        if shared_scale:
             fixed_t = ants_image_to_tensor(fixed_extra, device, dtype, normalize=False)
             moving_t = ants_image_to_tensor(moving_extra, device, dtype, normalize=False)
-            scale = FODRegistration.intensity_scale(fixed_t)
+            scale = _shared_intensity_scale(fixed_t)
             fixed_t, moving_t = fixed_t * scale, moving_t * scale
         else:
             fixed_t = ants_image_to_tensor(fixed_extra, device, dtype)
@@ -492,17 +494,6 @@ def _extra_contrast_tensors(pairs, weights, scale_from_fixed: bool, device, dtyp
     return torch.cat(fixed_channels, dim=1), torch.cat(moving_channels, dim=1)
 
 
-def _warp_extra_contrasts(pairs, coords, select, interpolator, padding_mode, device, dtype):
-    """The extra images chosen by ``select`` (``0`` fixed, ``1`` moving) sampled at ``coords``, as scalar images on the fixed grid."""
-    return [
-        tensor_to_ants_image(
-            _sample_output(ants_image_to_tensor(pair[select], device, dtype, normalize=False), coords, interpolator, padding_mode),
-            pair[0],
-        )
-        for pair in pairs
-    ]
-
-
 def _sample_output(image: Tensor, coords: Tensor, interpolator: str, padding_mode: str) -> Tensor:
     """Sample ``image`` at normalized ``coords`` for the warped outputs (``output_interpolator``)."""
     if interpolator == "linear":
@@ -510,6 +501,18 @@ def _sample_output(image: Tensor, coords: Tensor, interpolator: str, padding_mod
     if interpolator == "nearest":
         return grid_sample(image, coords, mode="nearest", padding_mode=padding_mode, align_corners=True)
     return grid_sample_nd(image, coords, interpolator=interpolator, padding_mode=padding_mode, align_corners=True)
+
+
+def _warp_extra_contrasts(pairs, coords, select, interpolator, padding_mode, device, dtype):
+    """The extra images chosen by ``select`` (``0`` fixed, ``1`` moving) sampled at ``coords``.
+
+    The results are scalar images on the fixed grid.
+    """
+    warped = []
+    for pair in pairs:
+        image = ants_image_to_tensor(pair[select], device, dtype, normalize=False)
+        warped.append(tensor_to_ants_image(_sample_output(image, coords, interpolator, padding_mode), pair[0]))
+    return warped
 
 
 def _resolve_device(device) -> torch.device:
@@ -580,12 +583,11 @@ def _fit_syn_level(
     use_analytical_gradients: bool = True,
     sobolev_alpha: Optional[float] = None,
     optimizer_lr: float = 1.0,
-    fod_reorient=None,
+    reorient_midpoint: Optional[Callable] = None,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor, list]:
-    # fod_reorient: optional callable (I_mid, J_mid, warp_l2r, warp_r2l) -> (I_mid, J_mid)
-    # applied to the images sampled at the midpoint before the similarity is
-    # evaluated (FOD reorientation by the half-warp Jacobians, see
-    # antstorch.syn.fod.FODRegistration.midpoint_hook).
+    # reorient_midpoint: optional callable (I_mid, J_mid, warp_l2r, warp_r2l) -> (I_mid, J_mid)
+    # applied to the images sampled at the midpoint before the similarity is evaluated
+    # (the ``midpoint_hook`` of syn_registration's ``reorientation``).
     device, dtype = I_curr.device, I_curr.dtype
     fixed_meta_t = metadata_tensors_from_dict(fixed_meta, device, dtype)
     moving_meta_t = metadata_tensors_from_dict(moving_meta, device, dtype)
@@ -666,8 +668,8 @@ def _fit_syn_level(
             use_analytical_gradients=use_analytical_gradients,
             compute_gradients=False,
         )
-        if fod_reorient is not None:
-            I_mid, J_mid = fod_reorient(I_mid, J_mid, warp_l2r_leaf, warp_r2l_leaf)
+        if reorient_midpoint is not None:
+            I_mid, J_mid = reorient_midpoint(I_mid, J_mid, warp_l2r_leaf, warp_r2l_leaf)
         loss = _similarity_loss(similarity, I_mid, J_mid, in_bounds_mask, window_size, num_bins)
         if not torch.isfinite(loss):
             raise FloatingPointError(f"non-finite SyN loss at resolution level {level_index + 1}")
@@ -853,8 +855,8 @@ def _fit_syn_level(
                 fixed_meta["spacing"], moving_meta["spacing"], M_phys, t_phys, None,
                 use_analytical_gradients=False, compute_gradients=False,
             )
-            if fod_reorient is not None:
-                I_f, J_f = fod_reorient(I_f, J_f, warp_l2r, warp_r2l)
+            if reorient_midpoint is not None:
+                I_f, J_f = reorient_midpoint(I_f, J_f, warp_l2r, warp_r2l)
             final_loss = float(_similarity_loss(similarity, I_f, J_f, m_f, window_size, num_bins).item())
         if final_loss >= best_loss:
             warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv = best_state
@@ -1049,17 +1051,14 @@ def syn_registration(
     antisymmetric: bool = True,
     gaussian_sigma_mode: Optional[str] = None,
     conservative_smooth: Optional[bool] = None,
+    extra_contrasts: Optional[Sequence[Sequence[ants.ANTsImage]]] = None,
+    extra_contrast_weights: Optional[Sequence[float]] = None,
+    reorientation=None,
+    output_interpolator: str = "linear",
     padding_mode: str = "zeros",
     outprefix: str = "",
     device: Optional[Union[str, torch.device]] = None,
     dtype: torch.dtype = torch.float32,
-    fod: bool = False,
-    fod_lmax: Optional[Sequence[int]] = None,
-    fod_directions=60,
-    fod_modulate: bool = False,
-    output_interpolator: Optional[str] = None,
-    extra_contrasts: Optional[Sequence[Sequence[ants.ANTsImage]]] = None,
-    extra_contrast_weights: Optional[Sequence[float]] = None,
     verbose: bool = False,
 ) -> Dict[str, object]:
     """Register ``moving`` onto ``fixed`` with (optionally affine-initialized) greedy symmetric SyN.
@@ -1285,35 +1284,30 @@ def syn_registration(
     :func:`antstorch.bspline_flows.bspline_svf_registration.bspline_svf_registration`'s
     ``shrink_factors``, this pyramid need not be a strict dyadic halving.
 
-    **Multi-component images and FODs.** ``fixed``/``moving`` may be
-    multi-component images: every channel is warped by the same deformation
-    and the similarity is evaluated over all channels (per channel for
-    ``'lncc'``; ``'lncc_joint'``/``'lncc2_joint'`` sum the window moments over
-    the channels first, treating each voxel as one vector). With ``fod=True``
-    the channels are taken to be an even-degree spherical harmonic series in
-    the MRtrix3 convention (see :mod:`antstorch.syn.sh`; read such images with
-    :func:`antstorch.syn.fod.fod_image_read`): both images are scaled by one
-    common factor (the 99th percentile of ``fixed``'s ``l = 0`` coefficient)
-    instead of the per-image percentile normalization, the affine stage runs
-    on the ``l = 0`` coefficient, each pyramid level registers the series
-    truncated to ``fod_lmax[level]`` (default: ``0, 2, 4, ...`` capped at 4,
-    like ``mrregister``), the images sampled at the SyN midpoint are
-    reoriented by the Jacobians of the half-warps with apodized point spread
-    functions on ``fod_directions`` directions (``60``, ``300`` or a direction
-    file), and ``warpedmovout``/``warpedfixout`` are reoriented by the total
-    forward/inverse maps (``fod_modulate=True`` also applies FOD modulation,
-    MRtrix3's ``-modulate fod``). The default ``syn_metric`` for FODs is
-    ``'lncc_joint'``; ``'mse'`` on the coefficients is the ``mrregister``
-    choice.
+    **Multi-component images.** ``fixed``/``moving`` may be multi-component
+    images with the same number of components: every channel is warped by the
+    same deformation and the similarity is evaluated over all channels (per
+    channel for ``'lncc'``; ``'lncc_joint'``/``'lncc2_joint'`` sum the window
+    moments over the channels first, treating each voxel as one vector). Both
+    images are scaled by one common factor, the 99th percentile of channel 0
+    of ``fixed``, instead of the per-image percentile normalization, and the
+    affine stage runs on channel 0 (the ``l = 0`` coefficient of a spherical
+    harmonic series). ``reorientation`` makes the channels transform with the
+    deformation, as ``antsApplyTransforms`` does for vector and tensor images.
+    It is an object with four methods: ``channels(image, level_index)`` (the
+    channels registered at a pyramid level), ``midpoint_hook(level_index,
+    fixed_meta, M_phys)`` (a callable reorienting the two images sampled at
+    the SyN midpoint, or ``None``), ``reorient_warped(image, displacement,
+    meta, affine=None)`` and ``reorient_affine(image, matrix_xyz)`` (the
+    warped outputs). For FOD images use :func:`antstorch.syn.fod_registration`,
+    which supplies a :class:`antstorch.syn.fod.FODReorientation`.
 
     ``output_interpolator`` selects how ``warpedmovout``/``warpedfixout`` are
     sampled (the registration itself always uses linear interpolation, as
-    ANTs does): ``'linear'`` (the default for scalar images, what
-    ``ants.registration`` returns), ``'cubic'`` (interpolating Catmull-Rom
-    cubic, the default for ``fod=True`` and the kernel of MRtrix3's
-    ``mrtransform``; it keeps the FODs' angular contrast, which trilinear
-    resampling blurs by several percent), ``'bspline'`` (approximating cubic
-    B-spline, see :func:`antstorch.syn.core.grid_sample_bspline_torch`) or
+    ANTs does): ``'linear'`` (the default, what ``ants.registration``
+    returns), ``'cubic'`` (interpolating Catmull-Rom cubic, the kernel of
+    MRtrix3's ``mrtransform``), ``'bspline'`` (approximating cubic B-spline,
+    see :func:`antstorch.syn.core.grid_sample_bspline_torch`) or
     ``'nearest'``.
 
     **Extra contrasts (multi-contrast registration).** ``extra_contrasts``
@@ -1323,20 +1317,17 @@ def syn_registration(
     ``fixed``/``moving``, like ``antsRegistration``'s multivariate extras or
     ``mrregister``'s additional contrasts. Each extra image is resampled
     linearly onto its primary image's grid when it lives on another one,
-    normalized like the primary image (``fod=True``: both images of a
-    contrast by one factor, the 99th percentile of the fixed one; otherwise
-    the per-image percentile normalization) and appended as a channel; with
-    ``fod=True`` it is registered at every pyramid level alongside the
-    truncated SH series and is never reoriented. ``extra_contrast_weights``
+    normalized like the primary image (multi-component primaries: both images
+    of a contrast by one factor, the 99th percentile of the fixed one;
+    otherwise the per-image percentile normalization) and appended as a
+    channel at every pyramid level; it is never reoriented. ``extra_contrast_weights``
     (one per contrast, default 1) scale a contrast's contribution to the
     similarity: its window moments for ``'lncc_joint'``, its squared
     differences for ``'mse'``. With ``affine_extra_contrasts`` (default
     ``True``) the extra contrasts also join the affine fit as further channels
     (each image percentile-normalized on its own, weighted like the dense
     stage), the way ``antsMultivariateTemplateConstruction2`` gives every
-    modality a metric in its affine stage; on the FOD ``l = 0`` channel alone
-    the affine misjudges global scale against a blurry template (6 to 8 % in
-    volume on 1.25 mm data), which a T1w channel removes. The warped extra
+    modality a metric in its affine stage. The warped extra
     images come back as ``warpedmovout_extras`` and
     ``warpedfixout_extras`` (lists in the order given, on the fixed grid).
 
@@ -1362,7 +1353,6 @@ def syn_registration(
         _SYNTX_DEFAULTS.get((regularizer, optimizer), _LEGACY_DEFAULTS) if syntx_defaults else _LEGACY_DEFAULTS
     )
     _levels_given, _iterations_given = levels is not None, reg_iterations is not None
-    _fod_default_metric = syn_metric is None  # FOD inputs get their own default metric (see below)
     if syn_metric is None:
         syn_metric = _defaults["syn_metric"]
     if levels is None:
@@ -1445,8 +1435,6 @@ def syn_registration(
         )
     if padding_mode not in ("zeros", "border", "reflection"):
         raise ValueError("padding_mode must be 'zeros', 'border', or 'reflection'")
-    if output_interpolator is None:
-        output_interpolator = "cubic" if fod else "linear"
     if output_interpolator not in _OUTPUT_INTERPOLATORS:
         raise ValueError(f"output_interpolator must be one of {_OUTPUT_INTERPOLATORS}, got {output_interpolator!r}")
     if output_interpolator in ("cubic", "bspline") and padding_mode == "reflection":
@@ -1528,35 +1516,22 @@ def syn_registration(
     # --- Extra contrasts (multi-contrast registration) -----------------------
     extra_pairs, extra_weights = _prepare_extra_contrasts(fixed, moving, extra_contrasts, extra_contrast_weights)
 
-    # --- FOD (spherical harmonic) inputs ----------------------------------
-    fod_registration = None
-    affine_fixed, affine_moving = fixed, moving
-    if fod:
-        if dimension != 3:
-            raise ValueError("fod=True requires 3-D spherical harmonic images")
-        if fixed.components != moving.components:
-            raise ValueError("fixed and moving must have the same number of spherical harmonic coefficients")
-        image_lmax = sh_lmax_of_image(fixed)
-        if fod_lmax is None:
-            fod_lmax = default_fod_lmax(len(levels), image_lmax)
-        fod_lmax = tuple(int(value) for value in fod_lmax)
-        if len(fod_lmax) != len(levels):
-            raise ValueError(f"fod_lmax must have one entry per level ({len(levels)}), got {len(fod_lmax)}")
-        fod_registration = FODRegistration(
-            image_lmax, fod_lmax, directions=fod_directions, modulate_output=fod_modulate,
-            extra_channels=len(extra_pairs), device=resolved_device, dtype=dtype,
+    # --- Multi-component images ---------------------------------------------
+    if fixed.components != moving.components:
+        raise ValueError(
+            f"fixed and moving must have the same number of components, got {fixed.components} and {moving.components}"
         )
-        if _fod_default_metric:
-            syn_metric = "lncc_joint"
-        # The affine stage is scalar: fit it on the l = 0 coefficient.
-        affine_fixed = fod_registration.scalar_channel(fixed)
-        affine_moving = fod_registration.scalar_channel(moving)
+    multi_component = fixed.components > 1
+    affine_fixed, affine_moving = fixed, moving
+    if multi_component:
+        # The affine stage is scalar: fit it on channel 0.
+        affine_fixed = ants.split_channels(fixed)[0]
+        affine_moving = ants.split_channels(moving)[0]
 
     # --- Affine stage -----------------------------------------------------
-    # The extra contrasts join the affine fit as further channels (per-image normalized, weighted as in
-    # the dense stage), as antsMultivariateTemplateConstruction2 gives every modality a metric in its
-    # affine stage. On the FOD l = 0 channel alone the affine misjudges global scale against a blurry
-    # template (6 to 8 % in volume on 1.25 mm CRASH data, under every similarity); a T1w channel removes it.
+    # The extra contrasts join the affine fit as further channels (per-image normalized, weighted as
+    # in the dense stage), as antsMultivariateTemplateConstruction2 gives every modality a metric in
+    # its affine stage.
     affine_extra = None
     if affine_extra_contrasts and extra_pairs and initial_affine is None:
         affine_extra = _extra_contrast_tensors(extra_pairs, extra_weights, False, resolved_device, dtype)
@@ -1613,8 +1588,8 @@ def syn_registration(
         warpedmovout_extras = _warp_extra_contrasts(
             extra_pairs, sampling_grid, 1, output_interpolator, padding_mode, resolved_device, dtype
         )
-        if fod_registration is not None:
-            warpedmovout_tensor = fod_registration.reorient_affine(warpedmovout_tensor, matrix_xyz)
+        if reorientation is not None:
+            warpedmovout_tensor = reorientation.reorient_affine(warpedmovout_tensor, matrix_xyz)
 
         matrix_out = matrix_xyz.detach().cpu()
         translation_out = translation_xyz.detach().cpu()
@@ -1640,8 +1615,9 @@ def syn_registration(
             "provenance": {
                 "type_of_transform": type_of_transform,
                 "affine_transform_type": type_of_transform,
-                "extra_contrasts": len(extra_pairs),
+                "n_extra_contrasts": len(extra_pairs),
                 "extra_contrast_weights": tuple(extra_weights),
+                "reorientation": None if reorientation is None else repr(reorientation),
                 "device": str(resolved_device),
                 "outprefix": resolved_outprefix,
             },
@@ -1654,25 +1630,18 @@ def syn_registration(
 
     fixed_meta_full = ants_image_metadata(fixed)
     moving_meta_full = ants_image_metadata(moving)
-    if fod_registration is not None:
-        # One common scale for every coefficient of both images keeps the
-        # series' relative amplitudes (and hence the FOD shapes) intact.
+    if multi_component:
+        # One common scale for every channel of both images keeps the channels'
+        # relative amplitudes (for an SH series, the FOD shapes) intact.
         I_full = ants_image_to_tensor(fixed, resolved_device, dtype, normalize=False)
         J_full = ants_image_to_tensor(moving, resolved_device, dtype, normalize=False)
-        fod_scale = fod_registration.intensity_scale(I_full)
-        I_full = I_full * fod_scale
-        J_full = J_full * fod_scale
+        scale = _shared_intensity_scale(I_full)
+        I_full = I_full * scale
+        J_full = J_full * scale
     else:
         I_full = ants_image_to_tensor(fixed, resolved_device, dtype)
         J_full = ants_image_to_tensor(moving, resolved_device, dtype)
-    I_extra, J_extra = _extra_contrast_tensors(
-        extra_pairs, extra_weights, fod_registration is not None, resolved_device, dtype
-    )
-    if I_extra is not None:
-        # Extra contrasts ride along as trailing channels: warped by the same maps, part of the
-        # same similarity (FODRegistration.channels keeps them at every lmax level).
-        I_full = torch.cat([I_full, I_extra], dim=1)
-        J_full = torch.cat([J_full, J_extra], dim=1)
+    I_extra, J_extra = _extra_contrast_tensors(extra_pairs, extra_weights, multi_component, resolved_device, dtype)
 
     # Resolve any spline-distance parameter into the base-level mesh size it
     # replaces, once, against fixed's FULL native-resolution domain -- matching
@@ -1732,14 +1701,19 @@ def syn_registration(
     level_loss_history = []
     for level_index, (factor, iteration_count) in enumerate(zip(levels, reg_iterations)):
         I_source, J_source = I_full, J_full
-        if fod_registration is not None:
-            I_source = fod_registration.channels(I_full, fod_lmax[level_index])
-            J_source = fod_registration.channels(J_full, fod_lmax[level_index])
+        if reorientation is not None:
+            I_source = reorientation.channels(I_full, level_index)
+            J_source = reorientation.channels(J_full, level_index)
+        if I_extra is not None:
+            # Extra contrasts ride along as trailing channels: warped by the same maps, part of
+            # the same similarity, never reoriented.
+            I_source = torch.cat([I_source, I_extra], dim=1)
+            J_source = torch.cat([J_source, J_extra], dim=1)
         I_level, fixed_meta_level = _downsample_image(I_source, fixed_meta_full, factor, syntx_parity)
         J_level, moving_meta_level = _downsample_image(J_source, moving_meta_full, factor, syntx_parity)
-        fod_reorient = None
-        if fod_registration is not None:
-            fod_reorient = fod_registration.midpoint_hook(fod_lmax[level_index], fixed_meta_level, M_phys)
+        reorient_midpoint = None
+        if reorientation is not None:
+            reorient_midpoint = reorientation.midpoint_hook(level_index, fixed_meta_level, M_phys)
         if warp_l2r is None:
             zeros = torch.zeros(
                 (1,) + fixed_meta_level["torch_shape"] + (dimension,), device=resolved_device, dtype=dtype
@@ -1778,8 +1752,8 @@ def syn_registration(
                     total_mesh_size_level = _scale_mesh_size(resolved_total_field_mesh_size_at_base_level, level_scale)
                     total_field_control_points = _mesh_size_control_points(total_mesh_size_level, dim)
                     message += f"total_field_control_points={total_field_control_points}, "
-            if fod_registration is not None:
-                message += f"lmax={fod_lmax[level_index]}, "
+            if reorientation is not None or I_extra is not None:
+                message += f"channels={I_level.shape[1]}, "
             message += f"iterations={iteration_count}"
             print(message)
 
@@ -1817,7 +1791,7 @@ def syn_registration(
             optimizer_lr=optimizer_lr,
             regadam_grad_sigma=regadam_grad_sigma,
             regadam_quotient_sigma=regadam_quotient_sigma,
-            fod_reorient=fod_reorient,
+            reorient_midpoint=reorient_midpoint,
         )
         level_loss_history.append(history)
 
@@ -1866,10 +1840,10 @@ def syn_registration(
     warpedfixout = _sample_output(
         ants_image_to_tensor(fixed, resolved_device, dtype, normalize=False), inverse_coords, output_interpolator, padding_mode
     )
-    if fod_registration is not None:
-        # Reorient the warped FODs by the Jacobians of the total pull-back maps.
-        warpedmovout = fod_registration.reorient_warped(warpedmovout, total_forward, fixed_meta_full)
-        warpedfixout = fod_registration.reorient_warped(warpedfixout, total_inverse, fixed_meta_full)
+    if reorientation is not None:
+        # Reorient the warped images by the Jacobians of the total pull-back maps.
+        warpedmovout = reorientation.reorient_warped(warpedmovout, total_forward, fixed_meta_full)
+        warpedfixout = reorientation.reorient_warped(warpedfixout, total_inverse, fixed_meta_full)
     warpedmovout_extras = _warp_extra_contrasts(
         extra_pairs, forward_coords, 1, output_interpolator, padding_mode, resolved_device, dtype
     )
@@ -1947,12 +1921,9 @@ def syn_registration(
             "syntx_defaults": syntx_defaults,
             "optimizer_lr": optimizer_lr,
             "use_analytical_gradients": use_analytical_gradients,
-            "fod": fod,
-            "fod_lmax": tuple(fod_lmax) if fod else None,
-            "fod_directions": fod_directions if fod else None,
-            "fod_modulate": fod_modulate if fod else None,
+            "reorientation": None if reorientation is None else repr(reorientation),
             "output_interpolator": output_interpolator,
-            "extra_contrasts": len(extra_pairs),
+            "n_extra_contrasts": len(extra_pairs),
             "extra_contrast_weights": tuple(extra_weights),
             "affine_fit": affine_result is not None,
             "device": str(resolved_device),

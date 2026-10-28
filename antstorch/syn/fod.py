@@ -1,4 +1,8 @@
-"""Fiber orientation distribution (FOD) registration support for :mod:`antstorch.syn`.
+"""Fiber orientation distribution (FOD) registration and templates for :mod:`antstorch.syn`.
+
+:func:`fod_registration` and :func:`build_fod_template` run
+:func:`antstorch.syn.syn_registration` and :func:`antstorch.syn.build_template`
+with a :class:`FODReorientation`.
 
 An FOD image is a multi-component image whose channels are the coefficients of
 an even-degree real spherical harmonic (SH) series in the MRtrix3 convention
@@ -16,13 +20,13 @@ top of a multichannel SyN:
   registered on a truncated series (lmax 0, then 2, then 4 by default);
 * **frames**: ITK/ANTs physical coordinates are LPS while MRtrix3 SH images
   are expressed in RAS scanner coordinates, so the Jacobians are conjugated by
-  ``diag(-1, -1, 1)`` before they act on fiber directions. The conversion is
-  tested against ``mrtransform -warp ... -reorient_fod yes``.
+  ``diag(-1, -1, 1)`` before they act on fiber directions, matching
+  ``mrtransform -reorient_fod yes``.
 """
 
 from __future__ import annotations
 
-from typing import Callable, Dict, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
@@ -30,6 +34,8 @@ from torch import Tensor
 
 from .core.jacobian import _spatial_jacobian_nd
 from .sh import FODReorienter, lmax_from_n, n_coefficients
+from .syn import syn_registration
+from .template import build_template
 
 __all__ = [
     "sh_lmax_of_image",
@@ -38,7 +44,9 @@ __all__ = [
     "default_fod_lmax",
     "pullback_jacobian",
     "direction_transform",
-    "FODRegistration",
+    "FODReorientation",
+    "fod_registration",
+    "build_fod_template",
 ]
 
 _LPS_TO_RAS = np.diag([-1.0, -1.0, 1.0])
@@ -57,7 +65,7 @@ def fod_image_read(filename: str):
 
     ``ants.image_read`` returns 4-D NIfTI files as 4-D scalar images; this
     folds the fourth axis into the components so the image can be passed to
-    :func:`antstorch.syn.syn_registration` with ``fod=True``. The SH
+    :func:`fod_registration` or :func:`build_fod_template`. The SH
     coefficients are kept exactly as stored (MRtrix3 expresses them in the
     RAS scanner frame); only the geometry is converted to ITK's LPS metadata.
     """
@@ -189,110 +197,102 @@ def direction_transform(jacobian: Tensor, sh_frame: str = "RAS") -> Tensor:
     raise ValueError("sh_frame must be 'RAS' (MRtrix3 SH images) or 'LPS'")
 
 
-class FODRegistration:
-    """FOD-specific state of one :func:`antstorch.syn.syn_registration` call.
+class FODReorientation:
+    """How FOD images transform under a registration: the ``reorientation`` of :func:`antstorch.syn.syn_registration`.
+
+    The channels are an even-degree SH series in the MRtrix3 convention. Each
+    pyramid level registers the series truncated to :meth:`level_lmax`, the
+    images sampled at the SyN midpoint are reoriented by the Jacobians of the
+    half-warps, and the warped outputs by the Jacobians of the total maps,
+    with the apodized-PSF kernels of :class:`antstorch.syn.sh.FODReorienter`
+    (which this class builds and caches per degree, device and dtype).
 
     Parameters
     ----------
     image_lmax : int
-        lmax of the input SH images.
-    levels_lmax : sequence of int
-        lmax used at each pyramid level (see :func:`default_fod_lmax`).
-    directions : int, str or array
-        aPSF directions for the reorientation (see :func:`antstorch.syn.sh.load_directions`).
-    modulate_output : bool
-        Apply FOD modulation (MRtrix3's ``-modulate fod``) to the warped output images.
+        lmax of the SH images.
+    lmax : int or sequence of int, default 4
+        An int gives ``mrregister``'s schedule, lmax 0 at the coarsest level,
+        then 2, 4, ..., capped at ``min(lmax, image_lmax)``
+        (see :func:`default_fod_lmax`); a sequence gives one lmax per level.
+    directions : int, str or array, default 60
+        aPSF directions (see :func:`antstorch.syn.sh.load_directions`).
+    modulate : bool, default False
+        Apply FOD modulation (MRtrix3's ``-modulate fod``) to the warped
+        output images.
     chunk_size : int
         Voxels per reorientation batch.
-    sh_frame : str
+    sh_frame : str, default 'RAS'
         Frame of the SH basis, ``'RAS'`` for MRtrix3 images.
-    extra_channels : int
-        Number of non-SH channels (extra contrasts) appended after the SH
-        coefficients of the images: they are registered at every level
-        alongside the series and are never reoriented.
-    device, dtype
-        Where the reorientation matrices live.
     """
 
     def __init__(
         self,
         image_lmax: int,
-        levels_lmax: Sequence[int],
         *,
+        lmax: Union[int, Sequence[int]] = 4,
         directions=60,
-        modulate_output: bool = False,
+        modulate: bool = False,
         chunk_size: int = 1 << 14,
         sh_frame: str = "RAS",
-        extra_channels: int = 0,
-        device=None,
-        dtype: torch.dtype = torch.float32,
     ):
         self.image_lmax = int(image_lmax)
-        self.levels_lmax = tuple(int(v) for v in levels_lmax)
-        for lmax in self.levels_lmax:
-            if lmax < 0 or lmax % 2 or lmax > self.image_lmax:
-                raise ValueError(
-                    f"per-level lmax values must be even and in [0, {self.image_lmax}] (the images' lmax), got {self.levels_lmax}"
-                )
+        if isinstance(lmax, (int, np.integer)):
+            if lmax < 0:
+                raise ValueError(f"lmax must be non-negative, got {lmax}")
+            self.lmax: Union[int, Tuple[int, ...]] = int(lmax)
+        else:
+            self.lmax = tuple(int(value) for value in lmax)
+            for value in self.lmax:
+                if value < 0 or value % 2 or value > self.image_lmax:
+                    raise ValueError(
+                        f"per-level lmax values must be even and in [0, {self.image_lmax}] "
+                        f"(the images' lmax), got {self.lmax}"
+                    )
         self.directions = directions
-        self.modulate_output = bool(modulate_output)
+        self.modulate = bool(modulate)
         self.chunk_size = int(chunk_size)
         self.sh_frame = sh_frame
-        self.extra_channels = int(extra_channels)
-        if self.extra_channels < 0:
-            raise ValueError(f"extra_channels must be non-negative, got {extra_channels}")
-        self.device = device
-        self.dtype = dtype
-        self._reorienters: Dict[int, FODReorienter] = {}
+        self._reorienters: Dict[tuple, FODReorienter] = {}
 
-    def reorienter(self, lmax: int) -> Optional[FODReorienter]:
+    def __repr__(self) -> str:
+        return (
+            f"FODReorientation(image_lmax={self.image_lmax}, lmax={self.lmax}, "
+            f"directions={self.directions!r}, modulate={self.modulate})"
+        )
+
+    def level_lmax(self, level_index: int) -> int:
+        """lmax registered at pyramid level ``level_index`` (0 is the coarsest)."""
+        if isinstance(self.lmax, int):
+            return default_fod_lmax(level_index + 1, self.image_lmax, self.lmax)[-1]
+        if level_index >= len(self.lmax):
+            raise ValueError(f"lmax has {len(self.lmax)} entries; the registration has more levels")
+        return self.lmax[level_index]
+
+    def reorienter(self, lmax: int, device=None, dtype: torch.dtype = torch.float32) -> Optional[FODReorienter]:
         """The (cached) :class:`FODReorienter` for ``lmax``; ``None`` for lmax 0 (nothing to reorient)."""
         if lmax < 2:
             return None
-        if lmax not in self._reorienters:
-            self._reorienters[lmax] = FODReorienter(lmax, self.directions, device=self.device, dtype=self.dtype)
-        return self._reorienters[lmax]
+        key = (int(lmax), str(device), dtype)
+        if key not in self._reorienters:
+            self._reorienters[key] = FODReorienter(lmax, self.directions, device=device, dtype=dtype)
+        return self._reorienters[key]
 
-    def channels(self, image: Tensor, lmax: int) -> Tensor:
-        """The channels registered at a level: the SH series up to ``lmax`` plus the trailing extra-contrast channels."""
-        sh_part = image[:, : n_coefficients(lmax)]
-        if self.extra_channels == 0:
-            return sh_part
-        return torch.cat([sh_part, image[:, image.shape[1] - self.extra_channels :]], dim=1)
+    def channels(self, image: Tensor, level_index: int) -> Tensor:
+        """The SH series up to the level's lmax."""
+        return image[:, : n_coefficients(self.level_lmax(level_index))]
 
-    @staticmethod
-    def split(image: Tensor, lmax: int) -> Tuple[Tensor, Tensor]:
-        """Split a ``[SH series up to lmax | extra channels]`` tensor into its SH and extra parts (the latter possibly empty)."""
+    def _reorient(self, image: Tensor, transform: Tensor, lmax: int, modulate: bool = False) -> Tensor:
+        """Reorient the SH part of ``image`` (series up to ``lmax``); trailing channels pass through unchanged."""
+        reorienter = self.reorienter(lmax, image.device, image.dtype)
+        if reorienter is None:
+            return image
         n = n_coefficients(lmax)
-        return image[:, :n], image[:, n:]
-
-    def _reorient(self, reorienter: FODReorienter, image: Tensor, transform: Tensor, lmax: int, modulate: bool = False) -> Tensor:
-        """Reorient the SH part of ``image`` (series up to ``lmax``) and carry its extra channels through unchanged."""
-        sh_part, extras = self.split(image, lmax)
+        sh_part, extras = image[:, :n], image[:, n:]
         out = reorienter.reorient(sh_part, transform, modulate=modulate, chunk_size=self.chunk_size)
         return out if extras.shape[1] == 0 else torch.cat([out, extras], dim=1)
 
-    @staticmethod
-    def scalar_channel(image):
-        """The ``l = 0`` coefficient of a multi-component ``ants.ANTsImage`` as a scalar image (for the affine stage)."""
-        import ants
-
-        return ants.split_channels(image)[0]
-
-    @staticmethod
-    def intensity_scale(image: Tensor, percentile: float = 99.0) -> float:
-        """``1 / percentile`` of the positive ``l = 0`` coefficients: one factor applied to every channel of both images."""
-        l0 = image[:, 0]
-        positive = l0[l0 > 0].detach()
-        if positive.numel() == 0:
-            return 1.0
-        if positive.numel() > 4_000_000:
-            index = torch.randint(0, positive.numel(), (4_000_000,), device=positive.device)
-            positive = positive[index]
-        value = float(torch.quantile(positive.float(), percentile / 100.0))
-        return 1.0 / value if value > 0 else 1.0
-
-    def midpoint_hook(self, lmax: int, fixed_meta: Dict[str, tuple], M_phys: Tensor) -> Optional[Callable]:
+    def midpoint_hook(self, level_index: int, fixed_meta: Dict[str, tuple], M_phys: Tensor) -> Optional[Callable]:
         """Callable reorienting the two images sampled at the SyN midpoint of a pyramid level.
 
         The returned function takes ``(I_mid, J_mid, warp_l2r, warp_r2l)`` and
@@ -304,39 +304,170 @@ class FODRegistration:
         through the sampled coefficients, not through the reorientation, as in
         ``mrregister``.
         """
-        reorienter = self.reorienter(lmax)
-        if reorienter is None:
+        lmax = self.level_lmax(level_index)
+        if lmax < 2:
             return None
         spacing, direction = fixed_meta["spacing"], fixed_meta["direction"]
         sh_frame = self.sh_frame
 
         def hook(I_mid: Tensor, J_mid: Tensor, warp_l2r: Tensor, warp_r2l: Tensor) -> Tuple[Tensor, Tensor]:
             with torch.no_grad():
-                transform_fixed = direction_transform(pullback_jacobian(warp_l2r.detach(), spacing, direction), sh_frame)
-                transform_moving = direction_transform(
-                    pullback_jacobian(warp_r2l.detach(), spacing, direction, affine=M_phys.detach()), sh_frame
-                )
-            return (
-                self._reorient(reorienter, I_mid, transform_fixed, lmax),
-                self._reorient(reorienter, J_mid, transform_moving, lmax),
-            )
+                fixed_jacobian = pullback_jacobian(warp_l2r.detach(), spacing, direction)
+                moving_jacobian = pullback_jacobian(warp_r2l.detach(), spacing, direction, affine=M_phys.detach())
+                transform_fixed = direction_transform(fixed_jacobian, sh_frame)
+                transform_moving = direction_transform(moving_jacobian, sh_frame)
+            return self._reorient(I_mid, transform_fixed, lmax), self._reorient(J_mid, transform_moving, lmax)
 
         return hook
 
-    def reorient_warped(self, image: Tensor, displacement: Tensor, meta: Dict[str, tuple], modulate: Optional[bool] = None) -> Tensor:
-        """Reorient a full-lmax image sampled through ``x + displacement`` on the grid described by ``meta``."""
-        reorienter = self.reorienter(self.image_lmax)
-        if reorienter is None:
-            return image
-        with torch.no_grad():
-            transform = direction_transform(pullback_jacobian(displacement, meta["spacing"], meta["direction"]), self.sh_frame)
-        return self._reorient(reorienter, image, transform, self.image_lmax, self.modulate_output if modulate is None else modulate)
+    def reorient_warped(
+        self, image: Tensor, displacement: Tensor, meta: Dict[str, tuple], affine: Optional[Tensor] = None
+    ) -> Tensor:
+        """Reorient a full-lmax image sampled through ``A (x + displacement) + b`` on the grid ``meta`` describes.
 
-    def reorient_affine(self, image: Tensor, matrix_xyz: Tensor, modulate: Optional[bool] = None) -> Tensor:
-        """Reorient a full-lmax image resampled through the pull-back affine ``x -> matrix_xyz x + t`` (ITK ``(x, y, z)`` order)."""
-        reorienter = self.reorienter(self.image_lmax)
-        if reorienter is None:
-            return image
+        ``affine`` is ``A`` in the reversed ``(z, y, x)`` component order (see
+        :func:`pullback_jacobian`); ``None`` for the identity.
+        """
+        with torch.no_grad():
+            jacobian = pullback_jacobian(displacement, meta["spacing"], meta["direction"], affine=affine)
+            transform = direction_transform(jacobian, self.sh_frame)
+        return self._reorient(image, transform, self.image_lmax, self.modulate)
+
+    def reorient_affine(self, image: Tensor, matrix_xyz: Tensor) -> Tensor:
+        """Reorient a full-lmax image resampled through the pull-back affine ``x -> matrix_xyz x + t``.
+
+        ``matrix_xyz`` is in ITK ``(x, y, z)`` order.
+        """
         jacobian = matrix_xyz.detach().to(device=image.device, dtype=image.dtype)
         transform = direction_transform(jacobian, self.sh_frame)
-        return self._reorient(reorienter, image, transform, self.image_lmax, self.modulate_output if modulate is None else modulate)
+        return self._reorient(image, transform, self.image_lmax, self.modulate)
+
+
+def _check_fod_images(*images) -> int:
+    """lmax shared by 3-D SH images with the same number of coefficients."""
+    for image in images:
+        if image.dimension != 3:
+            raise ValueError(f"FOD images must be 3-D spherical harmonic images, got a {image.dimension}-D image")
+    image_lmax = sh_lmax_of_image(images[0])
+    if any(image.components != images[0].components for image in images):
+        raise ValueError("all FOD images must have the same number of spherical harmonic coefficients")
+    return image_lmax
+
+
+def _check_level_count(lmax, kwargs) -> None:
+    levels = kwargs.get("levels")
+    if levels is not None and not isinstance(lmax, (int, np.integer)) and len(lmax) != len(levels):
+        raise ValueError(f"lmax must have one entry per level ({len(levels)}), got {len(lmax)}")
+
+
+def fod_registration(
+    fixed,
+    moving,
+    *,
+    lmax: Union[int, Sequence[int]] = 4,
+    directions=60,
+    modulate: bool = False,
+    syn_metric: str = "lncc_joint",
+    output_interpolator: str = "cubic",
+    **kwargs: Any,
+) -> Dict[str, object]:
+    """Register two FOD images with :func:`antstorch.syn.syn_registration`, reorienting the FODs.
+
+    ``fixed`` and ``moving`` are 3-D multi-component images whose channels are
+    an even-degree SH series in the MRtrix3 convention (see
+    :mod:`antstorch.syn.sh`; read MRtrix3 images with :func:`fod_image_read`).
+    Both are scaled by one common factor (the 99th percentile of ``fixed``'s
+    ``l = 0`` coefficient), the affine stage runs on the ``l = 0``
+    coefficient, each pyramid level registers the series truncated to the
+    level's lmax, the images sampled at the SyN midpoint are reoriented by the
+    Jacobians of the half-warps with apodized point spread functions, and
+    ``warpedmovout``/``warpedfixout`` are reoriented by the total maps.
+
+    Parameters
+    ----------
+    fixed, moving : ants.ANTsImage
+        SH images with the same number of coefficients.
+    lmax : int or sequence of int, default 4
+        Degree schedule (see :class:`FODReorientation`): an int caps
+        ``mrregister``'s ``0, 2, 4, ...``; a sequence gives one lmax per level.
+    directions : int, str or array, default 60
+        aPSF directions for the reorientation (``60``, ``300`` or a direction file).
+    modulate : bool, default False
+        Apply FOD modulation (MRtrix3's ``-modulate fod``) to the warped outputs.
+    syn_metric : str, default 'lncc_joint'
+        Similarity over the coefficients; ``'mse'`` is the ``mrregister`` choice.
+    output_interpolator : str, default 'cubic'
+        Interpolation of the warped outputs; the interpolating cubic is the
+        kernel of MRtrix3's ``mrtransform``.
+    **kwargs
+        Forwarded to :func:`antstorch.syn.syn_registration` (``type_of_transform``,
+        ``levels``, ``reg_iterations``, ``extra_contrasts``, ``device``, ...).
+
+    Returns
+    -------
+    dict
+        :func:`antstorch.syn.syn_registration`'s result; its ``provenance``
+        also records ``fod_lmax`` (per level), ``fod_directions`` and
+        ``fod_modulate``.
+    """
+    image_lmax = _check_fod_images(fixed, moving)
+    _check_level_count(lmax, kwargs)
+    reorientation = FODReorientation(image_lmax, lmax=lmax, directions=directions, modulate=modulate)
+    result = syn_registration(
+        fixed, moving, reorientation=reorientation, syn_metric=syn_metric,
+        output_interpolator=output_interpolator, **kwargs,
+    )
+    provenance = result["provenance"]
+    levels = provenance.get("levels")
+    provenance["fod_lmax"] = None if levels is None else tuple(reorientation.level_lmax(i) for i in range(len(levels)))
+    provenance["fod_directions"] = directions
+    provenance["fod_modulate"] = modulate
+    return result
+
+
+def build_fod_template(
+    initial_template=None,
+    image_list=None,
+    *,
+    lmax: Union[int, Sequence[int]] = 4,
+    directions=60,
+    modulate: bool = False,
+    syn_metric: str = "lncc_joint",
+    output_interpolator: str = "cubic",
+    **kwargs: Any,
+) -> Dict[str, Any]:
+    """Build an unbiased FOD template with :func:`antstorch.syn.build_template`, reorienting the FODs.
+
+    The registrations are those of :func:`fod_registration`, the template
+    shape update reorients the SH template by the Jacobian of the update, and
+    the Laplacian sharpening is applied per coefficient.
+
+    Parameters
+    ----------
+    initial_template : ants.ANTsImage, optional
+        Starting SH template (default: the weighted average of ``image_list``).
+    image_list : list of ants.ANTsImage
+        SH images with the same number of coefficients.
+    lmax, directions, modulate, syn_metric, output_interpolator
+        As in :func:`fod_registration`; ``output_interpolator`` also resamples
+        the template in the shape update.
+    **kwargs
+        Forwarded to :func:`antstorch.syn.build_template` (``iterations``,
+        ``extra_contrasts``, ``initial_alignment``, ``levels``, ``device``, ...).
+
+    Returns
+    -------
+    dict
+        :func:`antstorch.syn.build_template`'s result.
+    """
+    if image_list:
+        images = list(image_list) + ([initial_template] if initial_template is not None else [])
+        image_lmax = _check_fod_images(*images)
+    else:
+        image_lmax = 0  # build_template rejects the empty list
+    _check_level_count(lmax, kwargs)
+    reorientation = FODReorientation(image_lmax, lmax=lmax, directions=directions, modulate=modulate)
+    return build_template(
+        initial_template, image_list, reorientation=reorientation, syn_metric=syn_metric,
+        output_interpolator=output_interpolator, **kwargs,
+    )

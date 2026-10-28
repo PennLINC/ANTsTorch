@@ -16,13 +16,11 @@ absolute template change are recorded.  An optional linear pre-alignment
 (``initial_alignment``, the ANTs script's ``-r 1``) replaces the plain average
 of the unaligned inputs as the starting template.
 
-Multi-component images are supported, and with ``fod=True`` (forwarded to
-:func:`antstorch.syn.syn_registration`) the channels are treated as a spherical
-harmonic series in the MRtrix3 convention: the per-image registrations
-reorient the FODs, the shape update is applied to the SH template with
-reorientation by the Jacobian of the update (``ants.apply_transforms`` cannot
-do this: it treats a vector image either as scalars or as displacement
-vectors), and the Laplacian sharpening is applied per coefficient.
+Multi-component templates are updated in torch and sharpened per channel;
+with a ``reorientation`` (see :func:`antstorch.syn.syn_registration`) the shape
+update also reorients the template by the Jacobian of the update, which
+``ants.apply_transforms`` cannot do. :func:`antstorch.syn.build_fod_template`
+builds FOD templates this way.
 """
 
 from __future__ import annotations
@@ -38,6 +36,7 @@ import torch
 
 from ..ants_transform_io import read_affine_transform
 from .bridge import (
+    _same_grid,
     ants_image_metadata,
     ants_image_to_tensor,
     flip_affine_xyz_to_zyx,
@@ -45,23 +44,13 @@ from .bridge import (
     tensor_to_ants_image,
 )
 from .core.grid import get_physical_grid_torch, grid_sample_nd, physical_to_normalized_torch_cached
-from .fod import FODRegistration, direction_transform, pullback_jacobian, sh_lmax_of_image
-from .syn import _resolve_device
+from .syn import _LINEAR_TRANSFORM_TYPES, _OUTPUT_INTERPOLATORS, _resolve_device, syn_registration
 
 __all__ = ["build_template"]
 
 _MANAGED_KWARGS = ("initial_affine", "outprefix")
+# grid_sample_nd modes of syn_registration's output interpolators.
 _INTERPOLATOR_MODES = {"linear": "bilinear", "nearest": "nearest", "cubic": "cubic", "bspline": "bspline"}
-
-
-def _resolve_interpolator(kwargs: Dict[str, Any], fod: bool) -> str:
-    """The ``output_interpolator`` ``syn_registration`` will use for these kwargs (its default depends on ``fod``)."""
-    interpolator = kwargs.get("output_interpolator")
-    if interpolator is None:
-        interpolator = "cubic" if fod else "linear"
-    if interpolator not in _INTERPOLATOR_MODES:
-        raise ValueError(f"output_interpolator must be one of {tuple(_INTERPOLATOR_MODES)}, got {interpolator!r}")
-    return interpolator
 
 
 def _sample_like_itk(
@@ -78,7 +67,9 @@ def _sample_like_itk(
     ``cubic``), ``'bspline'`` or ``'nearest'``.
     """
     mode = _INTERPOLATOR_MODES[interpolator]
-    sampled = grid_sample_nd(tensor, coords, mode=mode, padding_mode="border", align_corners=True, interpolator=mode)
+    sampled = grid_sample_nd(
+        tensor, coords, mode=mode, padding_mode="border", align_corners=True, interpolator=mode
+    )
     dim = coords.shape[-1]
     inside = None
     for d in range(dim):
@@ -98,18 +89,14 @@ def _resample_vector_onto(
     0.6.3), so the resampling is done in torch; no reorientation is needed for
     the identity map, so this is valid for SH images too.
     """
-    if (
-        tuple(image.shape) == tuple(target.shape)
-        and np.allclose(image.spacing, target.spacing)
-        and np.allclose(image.origin, target.origin)
-        and np.allclose(np.asarray(image.direction), np.asarray(target.direction))
-    ):
+    if _same_grid(image, target):
         return image.clone()
     source_meta = ants_image_metadata(image)
     target_meta = ants_image_metadata(target)
     tensor = ants_image_to_tensor(image, device, torch.float32, normalize=False)
     X = get_physical_grid_torch(
-        target_meta["torch_shape"], target_meta["spacing"], target_meta["origin"], target_meta["direction"], device=device
+        target_meta["torch_shape"], target_meta["spacing"], target_meta["origin"], target_meta["direction"],
+        device=device,
     )
     mt = metadata_tensors_from_dict(source_meta, torch.device(device), torch.float32)
     coords = physical_to_normalized_torch_cached(X, mt["shape_t"], mt["spacing_t"], mt["origin_t"], mt["direction_t"])
@@ -117,28 +104,27 @@ def _resample_vector_onto(
     return tensor_to_ants_image(resampled, target)
 
 
-def _warp_sh_template(
-    template: ants.ANTsImage,
+def _apply_transforms_torch(
+    image: ants.ANTsImage,
     scaled_warp: Optional[ants.ANTsImage],
     affine_fn: Optional[str],
-    fod_tools: Optional[FODRegistration],
     interpolator: str = "linear",
-    device=None,
+    device="cpu",
+    reorientation=None,
 ) -> ants.ANTsImage:
-    """``ants.apply_transforms(fixed=template, moving=template, [warp, affine], whichtoinvert=[0, 1])`` in torch.
+    """``ants.apply_transforms`` of a template through its shape update, in torch.
 
-    The template is sampled at ``phi(x) = A^-1 ((x + w(x)) - t)`` (the warp
-    first, then the inverted average affine, ANTs' order for the transform
-    list) with ``interpolator`` (see :func:`_sample_like_itk`). With
-    ``fod_tools`` every FOD is also reoriented by ``(d phi / d x)^-1`` with the
-    apodized PSF method, exactly as the warped outputs of
-    :func:`antstorch.syn.syn_registration` are; ``None`` samples a scalar (or
-    other non-SH) template without reorientation.
+    Equivalent to ``ants.apply_transforms(fixed=image, moving=image, [warp,
+    affine], whichtoinvert=[0, 1])`` for multi-component images and
+    non-linear interpolators: the image is sampled at
+    ``phi(x) = A^-1 ((x + w(x)) - t)`` (the warp first, then the inverted
+    average affine, ANTs' order for the transform list) with ``interpolator``
+    (see :func:`_sample_like_itk`). With a ``reorientation`` the channels are
+    also reoriented by the Jacobian of ``phi``, as the warped outputs of
+    :func:`antstorch.syn.syn_registration` are.
     """
-    if device is None:
-        device = fod_tools.device if fod_tools is not None and fod_tools.device is not None else "cpu"
-    meta = ants_image_metadata(template)
-    tensor = ants_image_to_tensor(template, device, torch.float32, normalize=False)  # (1, C, z, y, x)
+    meta = ants_image_metadata(image)
+    tensor = ants_image_to_tensor(image, device, torch.float32, normalize=False)  # (1, C, z, y, x)
     X = get_physical_grid_torch(meta["torch_shape"], meta["spacing"], meta["origin"], meta["direction"], device=device)
     if scaled_warp is not None:
         warp_xyz = ants_image_to_tensor(scaled_warp, device, torch.float32, normalize=False)[0]  # (3, z, y, x)
@@ -152,21 +138,24 @@ def _warp_sh_template(
         inverse_matrix = np.linalg.inv(matrix)
         inverse_translation = -inverse_matrix @ translation
         affine_zyx, translation_zyx = flip_affine_xyz_to_zyx(
-            torch.as_tensor(inverse_matrix, dtype=torch.float32), torch.as_tensor(inverse_translation, dtype=torch.float32)
+            torch.as_tensor(inverse_matrix, dtype=torch.float32),
+            torch.as_tensor(inverse_translation, dtype=torch.float32),
         )
         affine_zyx = affine_zyx.to(device)
         points = points @ affine_zyx.transpose(0, 1) + translation_zyx.to(device)
     mt = metadata_tensors_from_dict(meta, torch.device(device), torch.float32)
-    coords = physical_to_normalized_torch_cached(points, mt["shape_t"], mt["spacing_t"], mt["origin_t"], mt["direction_t"])
+    coords = physical_to_normalized_torch_cached(
+        points, mt["shape_t"], mt["spacing_t"], mt["origin_t"], mt["direction_t"]
+    )
     warped = _sample_like_itk(tensor, coords, mt["shape_t"], interpolator)
-    reorienter = fod_tools.reorienter(fod_tools.image_lmax) if fod_tools is not None else None
-    if reorienter is not None:
-        jacobian = pullback_jacobian(displacement, meta["spacing"], meta["direction"], affine=affine_zyx)
-        warped = reorienter.reorient(
-            warped, direction_transform(jacobian, fod_tools.sh_frame), modulate=fod_tools.modulate_output,
-            chunk_size=fod_tools.chunk_size,
-        )
-    return tensor_to_ants_image(warped, template)
+    if reorientation is not None:
+        warped = reorientation.reorient_warped(warped, displacement, meta, affine=affine_zyx)
+    return tensor_to_ants_image(warped, image)
+
+
+def _scalar_reference(image: ants.ANTsImage) -> ants.ANTsImage:
+    """``image`` itself, or its first channel for a multi-component image (a scalar image on the same grid)."""
+    return ants.split_channels(image)[0] if image.components > 1 else image
 
 
 def _prepare_template_extras(
@@ -175,21 +164,24 @@ def _prepare_template_extras(
     """The extra contrasts of :func:`build_template` as lists of scalar images on their primary images' grids.
 
     ``extra_contrasts[c][k]`` belongs to ``image_list[k]``; an image on another grid (a 1 mm
-    T1-weighted volume next to a 1.8 mm FOD image, say) is resampled onto the primary grid
-    with ``interpolator``, since the template shape update shares one grid between the contrasts.
+    T1-weighted volume next to a 1.8 mm FOD image, say) is resampled onto the primary grid with
+    ``interpolator``, since the template shape update shares one grid between the contrasts.
     """
     extras: List[List[ants.ANTsImage]] = []
     for c, contrast in enumerate(extra_contrasts or ()):
         contrast = list(contrast)
         if len(contrast) != len(image_list):
             raise ValueError(
-                f"extra_contrasts[{c}] must hold one image per entry of image_list ({len(image_list)}), got {len(contrast)}"
+                f"extra_contrasts[{c}] must hold one image per entry of image_list ({len(image_list)}), "
+                f"got {len(contrast)}"
             )
         resampled = []
         for image, primary in zip(contrast, image_list):
             if image.components != 1:
-                raise ValueError(f"extra_contrasts[{c}]: extra contrasts must be scalar images, got {image.components} components")
-            target = primary if primary.components == 1 else FODRegistration.scalar_channel(primary)
+                raise ValueError(
+                    f"extra_contrasts[{c}]: extra contrasts must be scalar images, got {image.components} components"
+                )
+            target = _scalar_reference(primary)
             resampled.append(_resample_vector_onto(image, target, device=device, interpolator=interpolator))
         extras.append(resampled)
     return extras
@@ -197,31 +189,31 @@ def _prepare_template_extras(
 
 def _apply_shape_update(
     image: ants.ANTsImage,
-    tools: Optional[FODRegistration],
     scaled_warp: Optional[ants.ANTsImage],
     warp_fn: Optional[str],
     affine_fn: Optional[str],
     use_torch: bool,
     interpolator: str,
     device,
+    reorientation=None,
 ) -> ants.ANTsImage:
     """Move a template (or an extra-contrast template) by the scaled mean warp and the inverted average affine."""
     if scaled_warp is None and affine_fn is None:
         return image
     if use_torch:
-        return _warp_sh_template(image, scaled_warp, affine_fn, tools, interpolator, device)
+        return _apply_transforms_torch(image, scaled_warp, affine_fn, interpolator, device, reorientation)
     transforms = ([warp_fn] if warp_fn is not None else []) + ([affine_fn] if affine_fn is not None else [])
     invert = ([0] if warp_fn is not None else []) + ([1] if affine_fn is not None else [])
     return ants.apply_transforms(fixed=image, moving=image, transformlist=transforms, whichtoinvert=invert)
 
 
-def _sharpen_scalar_image(image: ants.ANTsImage, blending_weight: float) -> ants.ANTsImage:
-    """``w * image + (1 - w) * Sharpen(image)`` for a scalar image."""
-    return image * blending_weight + ants.iMath(image, "Sharpen") * (1.0 - blending_weight)
+def _sharpen_image(image: ants.ANTsImage, blending_weight: float) -> ants.ANTsImage:
+    """``w * image + (1 - w) * Sharpen(image)``, per component for a multi-component image.
 
-
-def _sharpen_vector_image(image: ants.ANTsImage, blending_weight: float) -> ants.ANTsImage:
-    """``w * image + (1 - w) * Sharpen(image)`` applied per component (``ants.iMath`` Sharpen is scalar only)."""
+    ``ants.iMath`` Sharpen is scalar only.
+    """
+    if image.components == 1:
+        return image * blending_weight + ants.iMath(image, "Sharpen") * (1.0 - blending_weight)
     array = np.asarray(image.numpy(), dtype=np.float32)
     out = np.empty_like(array)
     for c in range(array.shape[-1]):
@@ -230,12 +222,14 @@ def _sharpen_vector_image(image: ants.ANTsImage, blending_weight: float) -> ants
             out[..., c] = array[..., c]
             continue
         channel = ants.from_numpy(
-            np.ascontiguousarray(array[..., c]), origin=image.origin, spacing=image.spacing, direction=image.direction
+            np.ascontiguousarray(array[..., c]), origin=image.origin, spacing=image.spacing,
+            direction=image.direction,
         )
         sharpened = ants.iMath(channel, "Sharpen").numpy()
         out[..., c] = blending_weight * array[..., c] + (1.0 - blending_weight) * sharpened
     return ants.from_numpy(
-        np.ascontiguousarray(out), origin=image.origin, spacing=image.spacing, direction=image.direction, has_components=True
+        np.ascontiguousarray(out), origin=image.origin, spacing=image.spacing, direction=image.direction,
+        has_components=True,
     )
 
 
@@ -254,29 +248,33 @@ def _normalize_weights(weights: Optional[Sequence[float]], n: int) -> np.ndarray
     return w / total
 
 
-_LINEAR_ALIGNMENTS = ("Translation", "Rigid", "Similarity", "Affine")
-
-
 def _initial_alignment_reference(reference, image_list, extra_contrasts):
-    """Resolve ``initial_alignment_reference`` to ``(primary, extras or None, name, is_input)``; the primary is ``None`` for the average."""
+    """Resolve ``initial_alignment_reference`` to ``(primary, extras or None, name, is_input)``.
+
+    The primary is ``None`` for the average of the unaligned inputs.
+    """
     n_extra = len(extra_contrasts or ())
     if reference is None:
         return None, None, "the average of the unaligned inputs", False
     if isinstance(reference, (int, np.integer)) and not isinstance(reference, bool):
         if not 0 <= reference < len(image_list):
-            raise ValueError(f"initial_alignment_reference {reference} is not an index into image_list ({len(image_list)} images)")
+            raise ValueError(
+                f"initial_alignment_reference {reference} is not an index into image_list ({len(image_list)} images)"
+            )
         extras = [contrast[reference] for contrast in extra_contrasts] if n_extra else None
         return image_list[reference], extras, f"image {reference}", True
     if isinstance(reference, ants.ANTsImage):
         if n_extra:
             raise ValueError(
-                "with extra contrasts, initial_alignment_reference must be a sequence: the primary reference followed by one image per extra contrast"
+                "with extra contrasts, initial_alignment_reference must be a sequence: "
+                "the primary reference followed by one image per extra contrast"
             )
         return reference, None, "the given reference image", False
     images = list(reference)
     if len(images) != 1 + n_extra or not all(isinstance(image, ants.ANTsImage) for image in images):
         raise ValueError(
-            f"initial_alignment_reference must be an image index, an image, or a sequence of {1 + n_extra} images (primary + extra contrasts), got {reference!r}"
+            f"initial_alignment_reference must be an image index, an image, or a sequence of {1 + n_extra} images "
+            f"(primary + extra contrasts), got {reference!r}"
         )
     return images[0], (images[1:] or None), "the given reference images", False
 
@@ -369,18 +367,24 @@ def _apply_affine_to_vectors(fixed, moving, affine_file: str, invert: bool = Tru
 
 
 def _initial_extra_templates(extras, initial_extra_templates, weights, interpolator, primary, device):
-    """Starting templates of the extra contrasts: their weighted averages, or the given images resampled onto the primary's grid."""
+    """Starting templates of the extra contrasts.
+
+    These are their weighted averages, or the given images resampled onto the primary's grid.
+    """
     if initial_extra_templates is None:
         return [_initial_template(contrast, weights, interpolator) for contrast in extras]
     if len(initial_extra_templates) != len(extras):
         raise ValueError(
-            f"initial_extra_templates must hold one image per extra contrast ({len(extras)}), got {len(initial_extra_templates)}"
+            f"initial_extra_templates must hold one image per extra contrast ({len(extras)}), "
+            f"got {len(initial_extra_templates)}"
         )
-    target = primary if primary.components == 1 else FODRegistration.scalar_channel(primary)
+    target = _scalar_reference(primary)
     templates = []
     for c, image in enumerate(initial_extra_templates):
         if image.components != 1:
-            raise ValueError(f"initial_extra_templates[{c}] must be a scalar image, got {image.components} components")
+            raise ValueError(
+                f"initial_extra_templates[{c}] must be a scalar image, got {image.components} components"
+            )
         templates.append(_resample_vector_onto(image, target, device=device, interpolator=interpolator))
     return templates
 
@@ -403,6 +407,8 @@ def build_template(
     initial_alignment: Optional[str] = None,
     initial_alignment_iterations: int = 1,
     initial_alignment_reference: Optional[Union[int, ants.ANTsImage, Sequence[ants.ANTsImage]]] = 0,
+    output_interpolator: str = "linear",
+    reorientation=None,
     verbose: bool = False,
     **kwargs: Any,
 ) -> Dict[str, Any]:
@@ -457,8 +463,7 @@ def build_template(
         Starting template of each extra contrast (one scalar image per entry
         of ``extra_contrasts``, resampled onto the primary template's grid):
         together with ``initial_template`` this continues a build from a
-        previous result's ``template`` and ``extra_templates``, which is
-        how more iterations are added without starting over.  Default: the
+        previous result's ``template`` and ``extra_templates``.  Default: the
         weighted average of each contrast.
     initial_alignment : {'Translation', 'Rigid', 'Similarity', 'Affine'}, optional
         Linear pre-alignment of the inputs before the main loop, as
@@ -467,12 +472,11 @@ def build_template(
         contrasts included, see ``syn_registration``'s
         ``affine_extra_contrasts``) to ``initial_alignment_reference``, the
         aligned images are averaged, and that average starts the main loop
-        instead of the blurry average of the unaligned inputs.  ``'Affine'``
-        also places the template at the group's mean scale and shear, which
-        the dense shape update at ``gradient_step`` otherwise approaches only
-        slowly.  Runs as linear-only builds under ``<output_dir>/initial_<type>``
-        with the same ``kwargs`` and no sharpening; skipped when
-        ``initial_template`` is given.  Default: none.
+        instead of the average of the unaligned inputs.  ``'Affine'`` also
+        places the template at the group's mean scale and shear.  Runs as
+        linear-only builds under ``<output_dir>/initial_<type>`` with the same
+        ``kwargs`` and no sharpening; skipped when ``initial_template`` is
+        given.  Default: none.
     initial_alignment_iterations : int, default 1
         Passes of that pre-alignment (ANTs does one; two or three let an
         affine pass settle on the mean scale).  With a reference the first
@@ -483,30 +487,25 @@ def build_template(
         (with extra contrasts, a sequence: the primary reference followed by
         one image per extra contrast, e.g. an MNI template given as the
         ANTs script's ``-z``), or ``None`` for the plain average of the
-        unaligned inputs (the ANTs script without ``-z``).  One sharp
-        reference is the robust choice: in the average of unaligned inputs,
-        subsets that happen to share a pose show up as separate ghosts, and
-        each subset then registers to its own ghost, which every later
-        iteration preserves.  An input reference lends nothing but its pose,
-        and that pass averages the full transforms (rigid part included,
-        whatever ``use_no_rigid`` says) so the template ends at the group's
-        mean pose rather than the reference's; a reference given as an image
-        keeps its pose.  An affine pass takes any scale and shear of the
-        reference out again through the same average-affine update.
+        unaligned inputs (the ANTs script without ``-z``).  A single input
+        avoids the ghosts that subsets sharing a pose leave in the average of
+        unaligned inputs.  That pass averages the full transforms (rigid part
+        included, whatever ``use_no_rigid`` says), so the template ends at
+        the group's mean pose; a reference given as an image keeps its pose.
+    output_interpolator : {'linear', 'cubic', 'bspline', 'nearest'}, default 'linear'
+        Interpolation of the warped images (see ``syn_registration``) and of
+        the template in the shape update; ``'cubic'`` preserves the inputs'
+        sharpness through repeated resampling.
+    reorientation : optional
+        How the channels of multi-component images transform (see
+        ``syn_registration``); also applied to the template in the shape
+        update.  :func:`antstorch.syn.build_fod_template` passes a
+        :class:`antstorch.syn.fod.FODReorientation`.
     verbose : bool, default False
     **kwargs
         Forwarded to ``syn_registration`` (``regularizer``, ``syn_metric``,
         ``levels``, ``reg_iterations``, ``device``, ...).  ``initial_affine`` and
-        ``outprefix`` are managed here and rejected.  ``fod=True`` (with the
-        optional ``fod_lmax``, ``fod_directions``, ``fod_modulate``) builds a
-        template of spherical harmonic FOD images: the registrations reorient
-        the FODs, the shape update is applied to the SH template with
-        reorientation, and sharpening is applied per coefficient.
-        ``output_interpolator`` (``'linear'``, ``'cubic'``, ``'bspline'``,
-        ``'nearest'``; default ``'cubic'`` for FODs, ``'linear'`` otherwise)
-        is used both for the warped images and for resampling the template
-        in the shape update; the interpolating cubic keeps the template as
-        sharp as its inputs, where repeated trilinear resampling blurs it.
+        ``outprefix`` are managed here and rejected.
 
     Returns
     -------
@@ -517,10 +516,10 @@ def build_template(
         last iteration); ``convergence`` (mean absolute template
         change per iteration); ``shape_residuals`` (per iteration: ``l2_norm``,
         ``membrane_energy``, ``bending_energy`` of the mean warp);
-        ``n_iterations``; ``weights``; ``work_dir``; ``elapsed_sec``.
+        ``n_iterations``; ``weights``; ``work_dir``; ``initial_alignment``
+        (the pre-alignment templates, pass results and reference, or
+        ``None``); ``elapsed_sec``.
     """
-    from .syn import syn_registration  # local import: keeps ``antstorch.syn`` import order simple
-
     t0 = time.time()
     if image_list is None or len(image_list) == 0:
         raise ValueError("image_list must be a non-empty list of ANTsImages.")
@@ -536,30 +535,24 @@ def build_template(
 
     n = len(image_list)
     weights = _normalize_weights(weights, n)
-    interpolator = _resolve_interpolator(kwargs, bool(kwargs.get("fod", False)))
+    if output_interpolator not in _OUTPUT_INTERPOLATORS:
+        raise ValueError(f"output_interpolator must be one of {_OUTPUT_INTERPOLATORS}, got {output_interpolator!r}")
+    interpolator = output_interpolator
     torch_device = _resolve_device(kwargs.get("device"))
-
-    # FOD (spherical harmonic) inputs: the registrations handle the reorientation
-    # (``fod=True`` is forwarded to syn_registration); the template-side steps
-    # below need their own SH-aware versions.
-    fod_tools: Optional[FODRegistration] = None
-    if kwargs.get("fod", False):
-        components = image_list[0].components
-        if any(image.components != components for image in image_list):
-            raise ValueError("all FOD images must have the same number of spherical harmonic coefficients")
-        image_lmax = sh_lmax_of_image(image_list[0])
-        fod_tools = FODRegistration(
-            image_lmax, (image_lmax,), directions=kwargs.get("fod_directions", 60),
-            modulate_output=bool(kwargs.get("fod_modulate", False)), device=torch_device, dtype=torch.float32,
-        )
-    # The ANTs path (ants.apply_transforms) only offers linear interpolation of the
-    # template; SH templates and non-linear interpolators go through torch.
-    torch_template_update = fod_tools is not None or interpolator != "linear"
+    components = image_list[0].components
+    if any(image.components != components for image in image_list):
+        raise ValueError("all images in image_list must have the same number of components")
+    # The ANTs path (ants.apply_transforms) resamples a scalar template linearly; multi-component
+    # templates and other interpolators go through torch.
+    torch_template_update = components > 1 or interpolator != "linear"
 
     extras = _prepare_template_extras(image_list, extra_contrasts, interpolator, torch_device)
     n_extra = len(extras)
     if extra_contrast_weights is not None and len(extra_contrast_weights) != n_extra:
-        raise ValueError(f"extra_contrast_weights must have one entry per extra contrast ({n_extra}), got {len(extra_contrast_weights)}")
+        raise ValueError(
+            f"extra_contrast_weights must have one entry per extra contrast ({n_extra}), "
+            f"got {len(extra_contrast_weights)}"
+        )
 
     work_dir = tempfile.mkdtemp(prefix="antstorch_tmpl_") if output_dir is None else output_dir
     os.makedirs(work_dir, exist_ok=True)
@@ -567,8 +560,8 @@ def build_template(
     # Linear pre-alignment (ANTs' -r 1): linear-only builds of their own, whose templates start the main loop.
     initial_alignment_result: Optional[Dict[str, Any]] = None
     if initial_alignment is not None and initial_template is None:
-        if initial_alignment not in _LINEAR_ALIGNMENTS:
-            raise ValueError(f"initial_alignment must be one of {_LINEAR_ALIGNMENTS}, got {initial_alignment!r}")
+        if initial_alignment not in _LINEAR_TRANSFORM_TYPES:
+            raise ValueError(f"initial_alignment must be one of {_LINEAR_TRANSFORM_TYPES}, got {initial_alignment!r}")
         passes = int(initial_alignment_iterations)
         if passes < 1:
             raise ValueError(f"initial_alignment_iterations must be at least 1, got {initial_alignment_iterations}")
@@ -576,7 +569,10 @@ def build_template(
             initial_alignment_reference, image_list, extra_contrasts
         )
         if verbose:
-            print(f"[build_template] Initial {initial_alignment} alignment, {passes} pass(es), first against {reference_name}")
+            print(
+                f"[build_template] Initial {initial_alignment} alignment, {passes} pass(es), "
+                f"first against {reference_name}"
+            )
         sub = dict(
             image_list=image_list,
             weights=weights,
@@ -584,22 +580,22 @@ def build_template(
             extra_contrasts=extra_contrasts,
             extra_contrast_weights=extra_contrast_weights,
             blending_weight=1.0,
+            output_interpolator=output_interpolator,
+            reorientation=reorientation,
             verbose=verbose,
             **kwargs,
         )
         base = os.path.join(work_dir, f"initial_{initial_alignment.lower()}")
         pass_results: List[Dict[str, Any]] = []
         if reference is not None:
-            # The first pass targets one sharp image, never the average of the unaligned inputs: subsets that
-            # happen to share a pose would each lock onto their own ghost in that average, and every later
-            # iteration would keep the ghosts. An input used as the reference lends nothing but its pose, and
-            # averaging the full transforms (rigid part included) in this one pass moves the template on to the
-            # group's mean pose, so no input is favored; a reference given as an image keeps its own pose, the
-            # ANTs script's -z use (an MNI template, say).
+            # First pass against one image, not the average of the unaligned inputs (see
+            # initial_alignment_reference); with an input as the reference the full transforms are
+            # averaged, rigid part included, so the template lands at the group's mean pose.
             pass_results.append(
                 build_template(
                     iterations=1, output_dir=base + "_reference", initial_template=reference,
-                    initial_extra_templates=reference_extras, use_no_rigid=use_no_rigid and not reference_is_input, **sub,
+                    initial_extra_templates=reference_extras,
+                    use_no_rigid=use_no_rigid and not reference_is_input, **sub,
                 )
             )
             passes -= 1
@@ -626,8 +622,13 @@ def build_template(
         os.makedirs(d, exist_ok=True)
         return os.path.join(d, "out")
 
-    xavg = _initial_template(image_list, weights, interpolator) if initial_template is None else initial_template.clone()
-    xavg_extras = _initial_extra_templates(extras, initial_extra_templates, weights, interpolator, xavg, torch_device)
+    if initial_template is None:
+        xavg = _initial_template(image_list, weights, interpolator)
+    else:
+        xavg = initial_template.clone()
+    xavg_extras = _initial_extra_templates(
+        extras, initial_extra_templates, weights, interpolator, xavg, torch_device
+    )
 
     shape_residuals: List[Dict[str, float]] = []
     convergence: List[float] = []
@@ -664,6 +665,8 @@ def build_template(
                 image_list[k],
                 type_of_transform=iter_tot,
                 outprefix=make_outprefix(it, k),
+                output_interpolator=output_interpolator,
+                reorientation=reorientation,
                 verbose=verbose,
                 **reg_kw,
             )
@@ -688,7 +691,10 @@ def build_template(
             for c in range(n_extra):
                 last_warped_extras[c][k] = w1["warpedmovout_extras"][c]
                 warped_extra = w1["warpedmovout_extras"][c] * weight
-                xavg_extras_new[c] = warped_extra if xavg_extras_new[c] is None else xavg_extras_new[c] + warped_extra
+                if xavg_extras_new[c] is None:
+                    xavg_extras_new[c] = warped_extra
+                else:
+                    xavg_extras_new[c] = xavg_extras_new[c] + warped_extra
             if has_field:
                 field = ants.image_read(w1["fwdtransforms"][0]) * weight
                 wavg = field if wavg is None else wavg + field
@@ -724,7 +730,7 @@ def build_template(
 
         # antsApplyTransforms only needs the reference geometry from ``fixed``; a scalar
         # channel keeps it away from the multi-component template.
-        reference = xavg_new if fod_tools is None else fod_tools.scalar_channel(xavg_new)
+        reference = _scalar_reference(xavg_new)
         scaled: Optional[ants.ANTsImage] = None
         warp_fn: Optional[str] = None
         if has_field and wavg is not None:
@@ -734,18 +740,16 @@ def build_template(
             warp_fn = os.path.join(work_dir, f"avgWarp_{it}.nii.gz")
             ants.image_write(scaled, warp_fn)
         # The extra-contrast templates follow the primary template through the same update.
-        xavg = _apply_shape_update(xavg_new, fod_tools, scaled, warp_fn, affine_fn, torch_template_update, interpolator, torch_device)
-        xavg_extras = [
-            _apply_shape_update(image, None, scaled, warp_fn, affine_fn, torch_template_update, interpolator, torch_device)
-            for image in xavg_extras_new
-        ]
+        update = dict(
+            scaled_warp=scaled, warp_fn=warp_fn, affine_fn=affine_fn, use_torch=torch_template_update,
+            interpolator=interpolator, device=torch_device,
+        )
+        xavg = _apply_shape_update(xavg_new, reorientation=reorientation, **update)
+        xavg_extras = [_apply_shape_update(image, **update) for image in xavg_extras_new]
 
         if blending_weight < 1.0:
-            if fod_tools is not None:
-                xavg = _sharpen_vector_image(xavg, blending_weight)
-            else:
-                xavg = _sharpen_scalar_image(xavg, blending_weight)
-            xavg_extras = [_sharpen_scalar_image(image, blending_weight) for image in xavg_extras]
+            xavg = _sharpen_image(xavg, blending_weight)
+            xavg_extras = [_sharpen_image(image, blending_weight) for image in xavg_extras]
 
         change = _template_change(xavg_pre, xavg)
         convergence.append(change)

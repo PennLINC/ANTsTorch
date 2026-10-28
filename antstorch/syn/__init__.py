@@ -22,6 +22,9 @@ Exports are explicit and non-wildcard: ``antstorch/__init__.py`` does
 shadow names already exposed that way (``bspline_svf_registration``, ``warp_image``,
 ``jacobian_determinant``, ``compose_displacements``, ``folding_count``,
 ``physical_grid``, ``displacement_to_sampling_grid``).
+
+FOD (spherical harmonic) images are registered with :func:`fod_registration`
+and built into templates with :func:`build_fod_template` (:mod:`antstorch.syn.fod`).
 """
 
 from . import core
@@ -45,10 +48,9 @@ from .robust_affine import (
     compute_center_of_mass,
     compute_fov_center,
 )
-from . import sh
-from . import fod
+from . import fod, sh
 from .sh import FODReorienter
-from .fod import FODRegistration, fod_image_read, fod_image_write
+from .fod import FODReorientation, build_fod_template, fod_image_read, fod_image_write, fod_registration
 
 __all__ = [
     'core',
@@ -56,8 +58,10 @@ __all__ = [
     'fod',
     'syn_registration',
     'build_template',
+    'fod_registration',
+    'build_fod_template',
     'FODReorienter',
-    'FODRegistration',
+    'FODReorientation',
     'fod_image_read',
     'fod_image_write',
     'robust_affine',

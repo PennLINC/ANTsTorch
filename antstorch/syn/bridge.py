@@ -72,6 +72,16 @@ def ants_image_metadata(image) -> Dict[str, tuple]:
     }
 
 
+def _same_grid(image, reference) -> bool:
+    """Whether two ``ants.ANTsImage`` share shape, spacing, origin and direction."""
+    return (
+        tuple(image.shape) == tuple(reference.shape)
+        and np.allclose(image.spacing, reference.spacing)
+        and np.allclose(image.origin, reference.origin)
+        and np.allclose(np.asarray(image.direction), np.asarray(reference.direction))
+    )
+
+
 def ants_image_to_tensor(
     image,
     device: Optional[torch.device] = None,

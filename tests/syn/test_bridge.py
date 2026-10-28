@@ -200,3 +200,17 @@ def test_apply_bspline_smoothing_operator_is_invariant_to_chunk_size():
     for chunk_size in (17, 97, 4096):
         smoothed = apply_bspline_smoothing_operator(field, domain, mesh_size=3, chunk_size=chunk_size)
         torch.testing.assert_close(smoothed, reference, rtol=1e-10, atol=1e-10)
+
+
+def test_ants_image_to_tensor_multicomponent_roundtrip_and_channel_order():
+    rng = np.random.default_rng(0)
+    array = rng.random((8, 7, 6, 3), dtype=np.float32)  # channel-last (x, y, z, c)
+    image = ants.from_numpy(array, spacing=(2.0, 1.5, 1.0), has_components=True)
+    tensor = ants_image_to_tensor(image, normalize=False)
+    assert tensor.shape == (1, 3) + tuple(reversed(image.shape))
+    # channel c of the tensor is component c of the image, with (z, y, x) spatial order
+    np.testing.assert_allclose(tensor[0, 2].numpy(), array[..., 2].transpose(2, 1, 0), atol=1e-6)
+    recovered = tensor_to_ants_image(tensor, image)
+    assert recovered.components == 3
+    np.testing.assert_allclose(recovered.numpy(), array, atol=1e-6)
+    assert ants_image_metadata(recovered)["spacing"] == ants_image_metadata(image)["spacing"]
