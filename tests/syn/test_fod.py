@@ -1,5 +1,6 @@
 """Tests for antstorch.syn.fod: FOD (spherical harmonic) I/O, reorientation and fod_registration."""
 import math
+import warnings
 
 import ants
 import numpy as np
@@ -81,6 +82,31 @@ def test_fod_image_read_write_roundtrip_through_odx(tmp_path, extension):
     np.testing.assert_allclose(back.spacing, image.spacing, atol=1e-6)
     with pytest.raises(ValueError, match="mif.gz"):
         fod_image_write(image, str(tmp_path / "fod.mif"))
+
+
+def test_fod_image_read_warns_about_fixels_in_an_odx_dataset(tmp_path):
+    odx = pytest.importorskip("odx")
+    image = _fod_image((6, 7, 8), (3, 3, 4))
+    array = np.asarray(image.numpy(), dtype=np.float32)
+    mask = np.ascontiguousarray(np.any(array != 0, axis=-1), dtype=np.uint8)
+    affine = np.diag([-1.0, -1.0, 1.0, 1.0]) @ np.block(
+        [[np.asarray(image.direction) * np.asarray(image.spacing)[None, :], np.asarray(image.origin)[:, None]],
+         [np.zeros((1, 3)), np.ones((1, 1))]]
+    )
+    dataset = odx.from_sh_coefficients(
+        array, mask=mask, affine=affine, basis="tournier07", sh_order=4, legacy=False, compute_peaks=True
+    )
+    assert dataset.nb_peaks > 0
+    path = str(tmp_path / "with_fixels.odx")
+    odx.save(path, dataset)
+    with pytest.warns(UserWarning, match="fixels"):
+        back = fod_image_read(path)
+    assert back.components == image.components
+    # the files antstorch writes carry no fixels, so reading them back is silent
+    fod_image_write(back, str(tmp_path / "plain.odx"))
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        fod_image_read(str(tmp_path / "plain.odx"))
 
 
 def test_default_fod_lmax_follows_mrregister():

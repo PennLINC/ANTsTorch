@@ -29,6 +29,7 @@ from __future__ import annotations
 from typing import Any, Callable, Dict, Optional, Sequence, Tuple, Union
 
 import os
+import warnings
 
 import nibabel as nib
 import numpy as np
@@ -121,8 +122,11 @@ def fod_image_read(filename: str):
     geometry is converted to ITK's LPS metadata. ODX (``.odx``), MRtrix3
     (``.mif``, ``.mif.gz``) and DSI Studio (``.fib.gz``, ``.fz``) files are read
     with the optional ``odx`` package, their SH coefficients converted to the
-    MRtrix3 basis (``tournier07``). The result can be passed to
-    :func:`fod_registration` or :func:`build_fod_template`.
+    MRtrix3 basis (``tournier07``). Only the coefficients are read: fixels in
+    an ODX dataset are neither registered nor reoriented (a warning says so),
+    and the warped FODs that :func:`fod_image_write` saves carry none. The
+    result can be passed to :func:`fod_registration` or
+    :func:`build_fod_template`.
     """
     import ants
 
@@ -130,10 +134,16 @@ def fod_image_read(filename: str):
     if extension in _ODX_READERS:
         reader = getattr(_require_odx(filename), _ODX_READERS[extension])
         dataset = reader(str(filename))
-        if not dataset.sh_names:
+        if not dataset.sh_names():
             raise ValueError(f"{filename}: the dataset holds no SH coefficients")
         if dataset.sh_full_basis:
             raise ValueError(f"{filename}: full-basis (asymmetric) SH series are not supported")
+        if dataset.nb_peaks:
+            warnings.warn(
+                f"{filename}: only the SH coefficients are read; the dataset's {dataset.nb_peaks} fixels are "
+                "neither registered nor reoriented, and the warped FODs are written without them",
+                stacklevel=2,
+            )
         if dataset.sh_basis != "tournier07":
             dataset = dataset.convert_sh_basis_to("tournier07")
         return _from_ras_affine(dataset.densify_sh(), dataset.affine)
