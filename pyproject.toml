@@ -23,6 +23,7 @@ dependencies = [
     "scikit-learn",
     "numpy",
     "scipy",
+    "nibabel",
     "pandas",
     "requests",
     "statsmodels",

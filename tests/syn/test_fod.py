@@ -66,6 +66,23 @@ def test_fod_image_read_write_roundtrip_keeps_coefficients_and_geometry(tmp_path
     assert sh_lmax_of_image(back) == 4
 
 
+@pytest.mark.parametrize("extension", [".odx", ".mif.gz"])
+def test_fod_image_read_write_roundtrip_through_odx(tmp_path, extension):
+    pytest.importorskip("odx")
+    image = _fod_image((6, 7, 8), (3, 3, 4))
+    path = str(tmp_path / f"fod{extension}")
+    fod_image_write(image, path)
+    back = fod_image_read(path)
+    # odx stores voxels in RAS+ order, so compare through the geometry rather than array to array
+    resampled = ants.resample_image_to_target(ants.split_channels(back)[1], ants.split_channels(image)[1])
+    np.testing.assert_allclose(resampled.numpy(), image.numpy()[..., 1], atol=1e-5)
+    assert back.components == image.components and sh_lmax_of_image(back) == 4
+    np.testing.assert_allclose(np.abs(np.asarray(back.direction)), np.eye(3), atol=1e-6)
+    np.testing.assert_allclose(back.spacing, image.spacing, atol=1e-6)
+    with pytest.raises(ValueError, match="mif.gz"):
+        fod_image_write(image, str(tmp_path / "fod.mif"))
+
+
 def test_default_fod_lmax_follows_mrregister():
     assert default_fod_lmax(3, 8) == (0, 2, 4)
     assert default_fod_lmax(4, 8) == (0, 2, 4, 4)

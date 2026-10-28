@@ -28,9 +28,17 @@ from __future__ import annotations
 
 from typing import Any, Callable, Dict, Optional, Sequence, Tuple, Union
 
+import os
+
+import nibabel as nib
 import numpy as np
 import torch
 from torch import Tensor
+
+try:
+    import odx
+except ImportError:
+    odx = None
 
 from .core.jacobian import _spatial_jacobian_nd
 from .sh import FODReorienter, lmax_from_n, n_coefficients
@@ -60,17 +68,73 @@ def sh_lmax_of_image(image) -> int:
     return lmax_from_n(components)
 
 
-def fod_image_read(filename: str):
-    """Read an SH image written by MRtrix3 (a 4-D NIfTI) as a 3-D multi-component ``ants.ANTsImage``.
+_ODX_READERS = {".odx": "load", ".mif": "from_mrtrix", ".mif.gz": "from_mrtrix", ".fib.gz": "from_fibgz", ".fz": "from_fz"}
+_ODX_WRITERS = (".odx", ".mif.gz")
 
-    ``ants.image_read`` returns 4-D NIfTI files as 4-D scalar images; this
-    folds the fourth axis into the components so the image can be passed to
-    :func:`fod_registration` or :func:`build_fod_template`. The SH
-    coefficients are kept exactly as stored (MRtrix3 expresses them in the
-    RAS scanner frame); only the geometry is converted to ITK's LPS metadata.
+
+def _extension(filename: str) -> str:
+    name = str(filename).lower()
+    for extension in (".nii.gz", ".mif.gz", ".fib.gz"):
+        if name.endswith(extension):
+            return extension
+    return os.path.splitext(name)[1]
+
+
+def _require_odx(filename: str):
+    if odx is None:
+        raise ImportError(f"{filename}: reading and writing this format needs the odx package (pip install odx)")
+    return odx
+
+
+def _ras_affine(image) -> np.ndarray:
+    """The voxel-to-RAS affine of a 3-D ``ants.ANTsImage`` (NIfTI and MRtrix3 convention)."""
+    direction = np.asarray(image.direction, dtype=np.float64).reshape(3, 3)
+    affine_lps = np.eye(4)
+    affine_lps[:3, :3] = direction * np.asarray(image.spacing, dtype=np.float64)[None, :]
+    affine_lps[:3, 3] = np.asarray(image.origin, dtype=np.float64)
+    return np.diag([-1.0, -1.0, 1.0, 1.0]) @ affine_lps
+
+
+def _from_ras_affine(array: np.ndarray, affine_ras: np.ndarray):
+    """A multi-component ``ants.ANTsImage`` from a channel-last ``(x, y, z, n)`` array and its voxel-to-RAS affine."""
+    import ants
+
+    affine_lps = np.diag([-1.0, -1.0, 1.0, 1.0]) @ np.asarray(affine_ras, dtype=np.float64)
+    spacing = np.linalg.norm(affine_lps[:3, :3], axis=0)
+    return ants.from_numpy(
+        np.ascontiguousarray(array, dtype=np.float32),
+        origin=tuple(float(v) for v in affine_lps[:3, 3]),
+        spacing=tuple(float(v) for v in spacing),
+        direction=affine_lps[:3, :3] / spacing[None, :],
+        has_components=True,
+    )
+
+
+def fod_image_read(filename: str):
+    """Read an SH FOD image as a 3-D multi-component ``ants.ANTsImage`` in the MRtrix3 SH convention.
+
+    4-D NIfTI files (as written by MRtrix3) are read with ANTsPy: the fourth
+    axis becomes the components and the coefficients are kept exactly as
+    stored (MRtrix3 expresses them in the RAS scanner frame); only the
+    geometry is converted to ITK's LPS metadata. ODX (``.odx``), MRtrix3
+    (``.mif``, ``.mif.gz``) and DSI Studio (``.fib.gz``, ``.fz``) files are read
+    with the optional ``odx`` package, their SH coefficients converted to the
+    MRtrix3 basis (``tournier07``). The result can be passed to
+    :func:`fod_registration` or :func:`build_fod_template`.
     """
     import ants
 
+    extension = _extension(filename)
+    if extension in _ODX_READERS:
+        reader = getattr(_require_odx(filename), _ODX_READERS[extension])
+        dataset = reader(str(filename))
+        if not dataset.sh_names:
+            raise ValueError(f"{filename}: the dataset holds no SH coefficients")
+        if dataset.sh_full_basis:
+            raise ValueError(f"{filename}: full-basis (asymmetric) SH series are not supported")
+        if dataset.sh_basis != "tournier07":
+            dataset = dataset.convert_sh_basis_to("tournier07")
+        return _from_ras_affine(dataset.densify_sh(), dataset.affine)
     image = ants.image_read(filename)
     if image.dimension == 3 and image.components > 1:
         return image
@@ -88,21 +152,33 @@ def fod_image_read(filename: str):
 
 
 def fod_image_write(image, filename: str) -> None:
-    """Write a multi-component ``ants.ANTsImage`` as a 4-D NIfTI (RAS affine) that MRtrix3 reads as an SH image."""
-    import nibabel as nib
+    """Write a multi-component ``ants.ANTsImage`` of SH coefficients (MRtrix3 convention).
 
+    ``.nii``/``.nii.gz`` give a 4-D NIfTI with a RAS affine that MRtrix3 reads
+    as an SH image; ``.odx`` and ``.mif.gz`` are written with the optional
+    ``odx`` package (voxels whose coefficients are all zero are left out of
+    the ODX mask).
+    """
     if image.dimension != 3:
         raise ValueError("fod_image_write expects a 3-D multi-component image")
     array = np.asarray(image.numpy(), dtype=np.float32)
     if array.ndim == 3:
         array = array[..., None]
-    direction = np.asarray(image.direction, dtype=np.float64).reshape(3, 3)
-    spacing = np.asarray(image.spacing, dtype=np.float64)
-    origin = np.asarray(image.origin, dtype=np.float64)
-    affine_lps = np.eye(4)
-    affine_lps[:3, :3] = direction * spacing[None, :]
-    affine_lps[:3, 3] = origin
-    affine_ras = np.diag([-1.0, -1.0, 1.0, 1.0]) @ affine_lps
+    affine_ras = _ras_affine(image)
+    extension = _extension(filename)
+    if extension in _ODX_WRITERS:
+        mask = np.ascontiguousarray(np.any(array != 0, axis=-1), dtype=np.uint8)
+        dataset = _require_odx(filename).from_sh_coefficients(
+            np.ascontiguousarray(array), mask=mask, affine=affine_ras, basis="tournier07",
+            sh_order=lmax_from_n(array.shape[-1]), legacy=False, compute_peaks=False,
+        )
+        if extension == ".odx":
+            odx.save(str(filename), dataset)
+        else:
+            dataset.save_mif(str(filename), which="sh")
+        return
+    if extension == ".mif":
+        raise ValueError(f"{filename}: write MRtrix3 images as .mif.gz")
     nib.save(nib.Nifti1Image(np.ascontiguousarray(array), affine_ras), filename)
 
 
