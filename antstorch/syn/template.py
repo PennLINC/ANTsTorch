@@ -12,7 +12,9 @@ warped images, then moves that average back by ``gradient_step`` times the mean
 (negated) warp and the inverse of the average affine, so the template drifts
 toward the centre of shape of the group.  Per iteration the size and roughness
 of the mean warp (RMS displacement, membrane and bending energy) and the mean
-absolute template change are recorded.
+absolute template change are recorded.  An optional linear pre-alignment
+(``initial_alignment``, the ANTs script's ``-r 1``) replaces the plain average
+of the unaligned inputs as the starting template.
 
 Multi-component images are supported, and with ``fod=True`` (forwarded to
 :func:`antstorch.syn.syn_registration`) the channels are treated as a spherical
@@ -251,6 +253,9 @@ def _normalize_weights(weights: Optional[Sequence[float]], n: int) -> np.ndarray
     return w / total
 
 
+_LINEAR_ALIGNMENTS = ("Translation", "Rigid", "Similarity", "Affine")
+
+
 def _initial_template(
     image_list: List[ants.ANTsImage], weights: Sequence[float], interpolator: str = "linear"
 ) -> ants.ANTsImage:
@@ -370,6 +375,8 @@ def build_template(
     extra_contrasts: Optional[Sequence[Sequence[ants.ANTsImage]]] = None,
     extra_contrast_weights: Optional[Sequence[float]] = None,
     initial_extra_templates: Optional[Sequence[ants.ANTsImage]] = None,
+    initial_alignment: Optional[str] = None,
+    initial_alignment_iterations: int = 1,
     verbose: bool = False,
     **kwargs: Any,
 ) -> Dict[str, Any]:
@@ -427,6 +434,22 @@ def build_template(
         previous result's ``template`` and ``extra_templates``, which is
         how more iterations are added without starting over.  Default: the
         weighted average of each contrast.
+    initial_alignment : {'Translation', 'Rigid', 'Similarity', 'Affine'}, optional
+        Linear pre-alignment of the inputs before the main loop, as
+        ``antsMultivariateTemplateConstruction2.sh -r 1`` does with a rigid
+        pass: every image is registered to the plain average with this
+        transform type (the extra contrasts included, see
+        ``syn_registration``'s ``affine_extra_contrasts``), the aligned
+        images are averaged, and that average starts the main loop instead
+        of the blurry average of the unaligned inputs.  ``'Affine'`` also
+        places the template at the group's mean scale and shear, which the
+        dense shape update at ``gradient_step`` otherwise approaches only
+        slowly.  Runs in ``<output_dir>/initial_<type>`` with the same
+        ``kwargs`` and no sharpening; skipped when ``initial_template`` is
+        given.  Default: none.
+    initial_alignment_iterations : int, default 1
+        Passes of that pre-alignment (ANTs does one; two or three let an
+        affine pass settle on the mean scale).
     verbose : bool, default False
     **kwargs
         Forwarded to ``syn_registration`` (``regularizer``, ``syn_metric``,
@@ -499,6 +522,31 @@ def build_template(
 
     work_dir = tempfile.mkdtemp(prefix="antstorch_tmpl_") if output_dir is None else output_dir
     os.makedirs(work_dir, exist_ok=True)
+
+    # Linear pre-alignment (ANTs' -r 1): a linear-only build of its own, whose templates start the main loop.
+    initial_alignment_result: Optional[Dict[str, Any]] = None
+    if initial_alignment is not None and initial_template is None:
+        if initial_alignment not in _LINEAR_ALIGNMENTS:
+            raise ValueError(f"initial_alignment must be one of {_LINEAR_ALIGNMENTS}, got {initial_alignment!r}")
+        if int(initial_alignment_iterations) < 1:
+            raise ValueError(f"initial_alignment_iterations must be at least 1, got {initial_alignment_iterations}")
+        if verbose:
+            print(f"[build_template] Initial {initial_alignment} alignment, {int(initial_alignment_iterations)} pass(es)")
+        initial_alignment_result = build_template(
+            image_list=image_list,
+            iterations=int(initial_alignment_iterations),
+            weights=weights,
+            use_no_rigid=use_no_rigid,
+            output_dir=os.path.join(work_dir, f"initial_{initial_alignment.lower()}"),
+            type_of_transform=initial_alignment,
+            extra_contrasts=extra_contrasts,
+            extra_contrast_weights=extra_contrast_weights,
+            blending_weight=1.0,
+            verbose=verbose,
+            **kwargs,
+        )
+        initial_template = initial_alignment_result["template"]
+        initial_extra_templates = initial_alignment_result["extra_templates"]
 
     def make_outprefix(it: int, k: int) -> str:
         d = os.path.join(work_dir, f"iter{it:02d}_img{k:04d}")
@@ -648,5 +696,6 @@ def build_template(
         "n_iterations": len(shape_residuals),
         "weights": weights,
         "work_dir": work_dir,
+        "initial_alignment": initial_alignment_result,
         "elapsed_sec": time.time() - t0,
     }

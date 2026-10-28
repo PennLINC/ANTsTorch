@@ -31,6 +31,9 @@ def main():
                         help="interpolation of the warped images and of the template in the shape update")
     parser.add_argument("--extra", action="append", nargs="+", metavar="IMAGE", default=[],
                         help="an extra contrast (scalar images, one per FOD image in the same order); repeat for several contrasts")
+    parser.add_argument("--initial-alignment", default=None, choices=("Translation", "Rigid", "Similarity", "Affine"),
+                        help="linear pre-alignment of the inputs before the main loop (ANTs -r 1 is Rigid)")
+    parser.add_argument("--initial-alignment-iterations", type=int, default=1)
     parser.add_argument("--extra-weights", type=float, nargs="+", default=None,
                         help="weight of each extra contrast in the similarity (default 1)")
     args = parser.parse_args()
@@ -49,7 +52,9 @@ def main():
         blending_weight=args.blending_weight, output_dir=str(args.output_dir / "work"), type_of_transform="SyN",
         fod=True, syn_metric=args.metric, levels=(4, 2, 1), reg_iterations=tuple(args.reg_iterations),
         flow_sigma=args.flow_sigma, total_sigma=args.total_sigma, output_interpolator=args.output_interpolator,
-        extra_contrasts=extras or None, extra_contrast_weights=args.extra_weights, device=args.device, verbose=True,
+        extra_contrasts=extras or None, extra_contrast_weights=args.extra_weights,
+        initial_alignment=args.initial_alignment, initial_alignment_iterations=args.initial_alignment_iterations,
+        device=args.device, verbose=True,
     )
     fod_image_write(result["template"], str(args.output_dir / "template.nii.gz"))
     for path, warped in zip(args.images, result["warped_images"]):

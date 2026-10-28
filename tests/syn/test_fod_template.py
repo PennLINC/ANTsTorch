@@ -9,7 +9,7 @@ import torch
 from antstorch.ants_transform_io import write_affine_transform
 from antstorch.syn import build_template, sh
 from antstorch.syn.fod import FODRegistration
-from antstorch.syn.template import _resample_vector_onto, _sharpen_vector_image, _warp_sh_template
+from antstorch.syn.template import _initial_template, _resample_vector_onto, _sharpen_vector_image, _warp_sh_template
 
 _DIRECTION = np.diag([-1.0, -1.0, 1.0])
 
@@ -271,3 +271,31 @@ def test_build_template_continues_from_previous_templates(tmp_path):
             image_list=images, extra_contrasts=[extras], iterations=1, output_dir=str(tmp_path / "bad"),
             initial_template=first["template"], initial_extra_templates=[], **common,
         )
+
+
+def test_build_template_initial_alignment_starts_from_aligned_inputs(tmp_path):
+    centers = ((6, 6, 7), (4, 7, 8), (8, 6, 6))
+    images = [_fod_image((12, 13, 14), c) for c in centers]
+    extras = [_scalar_blob((12, 13, 14), c) * 3.0 for c in centers]
+    common = dict(
+        gradient_step=0.2, type_of_transform="SyN", fod=True, levels=(2, 1), reg_iterations=(2, 2), affine_iterations=(10, 10, 10),
+        affine_multi_start=False, device="cpu", blending_weight=1.0,
+    )
+    res = build_template(
+        image_list=images, extra_contrasts=[extras], iterations=1, output_dir=str(tmp_path / "aligned"), initial_alignment="Rigid", **common
+    )
+    pre = res["initial_alignment"]
+    assert pre is not None and pre["n_iterations"] == 1 and res["n_iterations"] == 1
+    assert os.path.isfile(os.path.join(tmp_path, "aligned", "initial_rigid", "iter00_img0000", "out0GenericAffine.mat"))
+    assert np.isfinite(res["template"].numpy()).all() and np.isfinite(res["extra_templates"][0].numpy()).all()
+    # Rigidly aligning the blobs before averaging gives a sharper starting template than the plain average.
+    plain = _initial_template(extras, [1.0 / 3.0] * 3, "linear")
+    assert pre["extra_templates"][0].numpy().max() > plain.numpy().max() + 0.1 * 3.0
+    # A supplied initial template skips the pre-alignment.
+    again = build_template(
+        image_list=images, extra_contrasts=[extras], iterations=1, output_dir=str(tmp_path / "given"), initial_alignment="Rigid",
+        initial_template=res["template"], initial_extra_templates=res["extra_templates"], **common,
+    )
+    assert again["initial_alignment"] is None
+    with pytest.raises(ValueError, match="initial_alignment must be one of"):
+        build_template(image_list=images, iterations=1, output_dir=str(tmp_path / "bad"), initial_alignment="SyN", **common)

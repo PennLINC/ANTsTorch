@@ -174,6 +174,7 @@ class TestBuildTemplateSyN:
             "n_iterations",
             "weights",
             "work_dir",
+            "initial_alignment",
             "elapsed_sec",
         }
 
