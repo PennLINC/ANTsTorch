@@ -115,10 +115,10 @@ python examples/n4_synthetic.py
 python examples/syn_registration.py --output-dir example_outputs/syn
 
 # FOD registration with reorientation: provide two MRtrix3 spherical harmonic images (4-D NIfTI)
-python examples/fod_registration.py fixed_fod.nii.gz moving_fod.nii.gz --output-dir example_outputs/fod --device cuda
+python examples/fod_registration.py fixed_fod.nii.gz moving_fod.nii.gz --output-dir example_outputs/fod
 
 # Unbiased FOD template from several spherical harmonic images
-python examples/fod_template.py sub-*_fod.nii.gz --output-dir example_outputs/fod_template --device cuda
+python examples/fod_template.py sub-*_fod.nii.gz --output-dir example_outputs/fod_template
 
 # Brain extraction: provide your own T1 MRI
 python examples/brain_extraction.py /path/to/t1.nii.gz --output-dir example_outputs/brain

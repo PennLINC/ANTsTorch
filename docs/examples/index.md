@@ -9,11 +9,11 @@ they use ANTsTorch rather than assuming ANTsPyNet APIs are interchangeable.
 | U-Net forward pass | `python examples/unet_2d.py` | Offline; prints `(1, 3, 64, 64)` probabilities from random weights |
 | N4 correction | `python examples/n4_synthetic.py` | Offline; prints corrected tensor shape; short synthetic demonstration |
 | SyN registration | `python examples/syn_registration.py` | Downloads r16/r64; writes warped image, Jacobian and transforms to `example_outputs/syn/` |
-| FOD registration | `python examples/fod_registration.py fixed_fod.nii.gz moving_fod.nii.gz` | Provide two MRtrix3 spherical harmonic images (4-D NIfTI); `--extra fixed_t1.nii.gz moving_t1.nii.gz` registers a further contrast together with the FODs; writes the reoriented warped FOD image, Jacobian and transforms to `example_outputs/fod/` |
-| FOD template | `python examples/fod_template.py sub-*_fod.nii.gz` | Provide several MRtrix3 spherical harmonic images; `--extra sub-*_t1.nii.gz` adds a contrast with a template of its own; writes the templates and the warped inputs to `example_outputs/fod_template/` |
+| FOD registration | `python examples/fod_registration.py fixed_fod.nii.gz moving_fod.nii.gz` | Provide two MRtrix3 SH images (4-D NIfTI); `--extra` adds a T1w pair; writes the reoriented warped FOD image, Jacobian and transforms to `example_outputs/fod/` |
+| FOD template | `python examples/fod_template.py sub-*_fod.nii.gz` | Provide several MRtrix3 SH images; `--extra` adds one T1w per subject; writes the templates to `example_outputs/fod_template/` |
 | Brain extraction | `python examples/brain_extraction.py /path/to/t1.nii.gz` | Downloads pretrained assets; writes probability, thresholded mask and brain image to `example_outputs/brain/` |
 
-The last two scripts accept `--device` and `--output-dir`; `--help` lists their
+The registration, template and brain-extraction scripts accept `--device` and `--output-dir`; `--help` lists their
 options. Existing files with the same output names are overwritten. Brain
 extraction uses a 0.5 probability threshold; inspect the mask on your input image.
 Scripts do not open plot windows and are not executed during documentation builds.
@@ -24,5 +24,7 @@ Scripts do not open plot windows and are not executed during documentation build
 unet_2d
 n4_synthetic
 syn_registration
+fod_registration
+fod_template
 brain_extraction
 ```

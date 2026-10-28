@@ -181,6 +181,27 @@ result_3d = syn_registration(
 )
 ```
 
+## Multi-component images and FODs
+
+`fixed` and `moving` may be multi-component images with the same number of
+components. Both are scaled by one common factor, the affine stage runs on
+channel 0, and `syn_metric="lncc_joint"` correlates the channels as one vector.
+`extra_contrasts` adds scalar image pairs, such as T1-weighted volumes, that are
+warped by the same transform and enter the same similarity.
+
+Diffusion MRI fiber orientation distributions (MRtrix3 spherical harmonic
+images) also need reorientation, which `fod_registration` supplies:
+
+```python
+from antstorch.syn import fod_image_read, fod_registration
+
+fixed_fod = fod_image_read("fixed_fod.nii.gz")
+moving_fod = fod_image_read("moving_fod.nii.gz")
+result = fod_registration(fixed_fod, moving_fod, type_of_transform="SyN")
+```
+
+`build_fod_template` builds FOD templates the same way.
+
 ## Device selection
 
 `device=None` (the default) auto-detects `cuda` &#8594; `mps` &#8594; `cpu`, with one
@@ -199,6 +220,7 @@ actually used is reported in `result["provenance"]["device"]`.
 |---|---|
 | `warpedmovout` | `ants.ANTsImage`, moving warped onto the fixed grid |
 | `warpedfixout` | `ants.ANTsImage`, fixed warped onto the moving grid (SyN only) |
+| `warpedmovout_extras`, `warpedfixout_extras` | lists of warped extra contrasts (empty without `extra_contrasts`) |
 | `fwdtransforms`, `invtransforms` | lists of file paths, `ants.registration()` convention |
 | `jacobian` | `ants.ANTsImage`, physical Jacobian determinant of the total forward deformation (SyN only) |
 | `affine_matrix`, `affine_translation` | in-memory copy of the fitted/supplied affine, ITK order, or `None` |
