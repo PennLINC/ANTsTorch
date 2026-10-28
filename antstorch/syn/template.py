@@ -30,7 +30,7 @@ from __future__ import annotations
 import os
 import tempfile
 import time
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import ants
 import numpy as np
@@ -256,6 +256,30 @@ def _normalize_weights(weights: Optional[Sequence[float]], n: int) -> np.ndarray
 _LINEAR_ALIGNMENTS = ("Translation", "Rigid", "Similarity", "Affine")
 
 
+def _initial_alignment_reference(reference, image_list, extra_contrasts):
+    """Resolve ``initial_alignment_reference`` to ``(primary, extras or None, name, is_input)``; the primary is ``None`` for the average."""
+    n_extra = len(extra_contrasts or ())
+    if reference is None:
+        return None, None, "the average of the unaligned inputs", False
+    if isinstance(reference, (int, np.integer)) and not isinstance(reference, bool):
+        if not 0 <= reference < len(image_list):
+            raise ValueError(f"initial_alignment_reference {reference} is not an index into image_list ({len(image_list)} images)")
+        extras = [contrast[reference] for contrast in extra_contrasts] if n_extra else None
+        return image_list[reference], extras, f"image {reference}", True
+    if isinstance(reference, ants.ANTsImage):
+        if n_extra:
+            raise ValueError(
+                "with extra contrasts, initial_alignment_reference must be a sequence: the primary reference followed by one image per extra contrast"
+            )
+        return reference, None, "the given reference image", False
+    images = list(reference)
+    if len(images) != 1 + n_extra or not all(isinstance(image, ants.ANTsImage) for image in images):
+        raise ValueError(
+            f"initial_alignment_reference must be an image index, an image, or a sequence of {1 + n_extra} images (primary + extra contrasts), got {reference!r}"
+        )
+    return images[0], (images[1:] or None), "the given reference images", False
+
+
 def _initial_template(
     image_list: List[ants.ANTsImage], weights: Sequence[float], interpolator: str = "linear"
 ) -> ants.ANTsImage:
@@ -377,6 +401,7 @@ def build_template(
     initial_extra_templates: Optional[Sequence[ants.ANTsImage]] = None,
     initial_alignment: Optional[str] = None,
     initial_alignment_iterations: int = 1,
+    initial_alignment_reference: Optional[Union[int, ants.ANTsImage, Sequence[ants.ANTsImage]]] = 0,
     verbose: bool = False,
     **kwargs: Any,
 ) -> Dict[str, Any]:
@@ -437,19 +462,36 @@ def build_template(
     initial_alignment : {'Translation', 'Rigid', 'Similarity', 'Affine'}, optional
         Linear pre-alignment of the inputs before the main loop, as
         ``antsMultivariateTemplateConstruction2.sh -r 1`` does with a rigid
-        pass: every image is registered to the plain average with this
-        transform type (the extra contrasts included, see
-        ``syn_registration``'s ``affine_extra_contrasts``), the aligned
-        images are averaged, and that average starts the main loop instead
-        of the blurry average of the unaligned inputs.  ``'Affine'`` also
-        places the template at the group's mean scale and shear, which the
-        dense shape update at ``gradient_step`` otherwise approaches only
-        slowly.  Runs in ``<output_dir>/initial_<type>`` with the same
-        ``kwargs`` and no sharpening; skipped when ``initial_template`` is
-        given.  Default: none.
+        pass: every image is registered with this transform type (the extra
+        contrasts included, see ``syn_registration``'s
+        ``affine_extra_contrasts``) to ``initial_alignment_reference``, the
+        aligned images are averaged, and that average starts the main loop
+        instead of the blurry average of the unaligned inputs.  ``'Affine'``
+        also places the template at the group's mean scale and shear, which
+        the dense shape update at ``gradient_step`` otherwise approaches only
+        slowly.  Runs as linear-only builds under ``<output_dir>/initial_<type>``
+        with the same ``kwargs`` and no sharpening; skipped when
+        ``initial_template`` is given.  Default: none.
     initial_alignment_iterations : int, default 1
         Passes of that pre-alignment (ANTs does one; two or three let an
-        affine pass settle on the mean scale).
+        affine pass settle on the mean scale).  With a reference the first
+        pass targets it and the later passes target the running average.
+    initial_alignment_reference : int, ants.ANTsImage or sequence of ants.ANTsImage, optional
+        Target of the first pre-alignment pass: an index into ``image_list``
+        (default ``0``, the first input, with its extra contrasts), an image
+        (with extra contrasts, a sequence: the primary reference followed by
+        one image per extra contrast, e.g. an MNI template given as the
+        ANTs script's ``-z``), or ``None`` for the plain average of the
+        unaligned inputs (the ANTs script without ``-z``).  One sharp
+        reference is the robust choice: in the average of unaligned inputs,
+        subsets that happen to share a pose show up as separate ghosts, and
+        each subset then registers to its own ghost, which every later
+        iteration preserves.  An input reference lends nothing but its pose,
+        and that pass averages the full transforms (rigid part included,
+        whatever ``use_no_rigid`` says) so the template ends at the group's
+        mean pose rather than the reference's; a reference given as an image
+        keeps its pose.  An affine pass takes any scale and shear of the
+        reference out again through the same average-affine update.
     verbose : bool, default False
     **kwargs
         Forwarded to ``syn_registration`` (``regularizer``, ``syn_metric``,
@@ -523,21 +565,22 @@ def build_template(
     work_dir = tempfile.mkdtemp(prefix="antstorch_tmpl_") if output_dir is None else output_dir
     os.makedirs(work_dir, exist_ok=True)
 
-    # Linear pre-alignment (ANTs' -r 1): a linear-only build of its own, whose templates start the main loop.
+    # Linear pre-alignment (ANTs' -r 1): linear-only builds of their own, whose templates start the main loop.
     initial_alignment_result: Optional[Dict[str, Any]] = None
     if initial_alignment is not None and initial_template is None:
         if initial_alignment not in _LINEAR_ALIGNMENTS:
             raise ValueError(f"initial_alignment must be one of {_LINEAR_ALIGNMENTS}, got {initial_alignment!r}")
-        if int(initial_alignment_iterations) < 1:
+        passes = int(initial_alignment_iterations)
+        if passes < 1:
             raise ValueError(f"initial_alignment_iterations must be at least 1, got {initial_alignment_iterations}")
+        reference, reference_extras, reference_name, reference_is_input = _initial_alignment_reference(
+            initial_alignment_reference, image_list, extra_contrasts
+        )
         if verbose:
-            print(f"[build_template] Initial {initial_alignment} alignment, {int(initial_alignment_iterations)} pass(es)")
-        initial_alignment_result = build_template(
+            print(f"[build_template] Initial {initial_alignment} alignment, {passes} pass(es), first against {reference_name}")
+        sub = dict(
             image_list=image_list,
-            iterations=int(initial_alignment_iterations),
             weights=weights,
-            use_no_rigid=use_no_rigid,
-            output_dir=os.path.join(work_dir, f"initial_{initial_alignment.lower()}"),
             type_of_transform=initial_alignment,
             extra_contrasts=extra_contrasts,
             extra_contrast_weights=extra_contrast_weights,
@@ -545,8 +588,39 @@ def build_template(
             verbose=verbose,
             **kwargs,
         )
-        initial_template = initial_alignment_result["template"]
-        initial_extra_templates = initial_alignment_result["extra_templates"]
+        base = os.path.join(work_dir, f"initial_{initial_alignment.lower()}")
+        pass_results: List[Dict[str, Any]] = []
+        if reference is not None:
+            # The first pass targets one sharp image, never the average of the unaligned inputs: subsets that
+            # happen to share a pose would each lock onto their own ghost in that average, and every later
+            # iteration would keep the ghosts. An input used as the reference lends nothing but its pose, and
+            # averaging the full transforms (rigid part included) in this one pass moves the template on to the
+            # group's mean pose, so no input is favored; a reference given as an image keeps its own pose, the
+            # ANTs script's -z use (an MNI template, say).
+            pass_results.append(
+                build_template(
+                    iterations=1, output_dir=base + "_reference", initial_template=reference,
+                    initial_extra_templates=reference_extras, use_no_rigid=use_no_rigid and not reference_is_input, **sub,
+                )
+            )
+            passes -= 1
+        if passes > 0:
+            seed = pass_results[-1] if pass_results else None
+            pass_results.append(
+                build_template(
+                    iterations=passes, output_dir=base, use_no_rigid=use_no_rigid,
+                    initial_template=None if seed is None else seed["template"],
+                    initial_extra_templates=None if seed is None else seed["extra_templates"], **sub,
+                )
+            )
+        initial_template = pass_results[-1]["template"]
+        initial_extra_templates = pass_results[-1]["extra_templates"]
+        initial_alignment_result = {
+            "template": initial_template,
+            "extra_templates": initial_extra_templates,
+            "passes": pass_results,
+            "reference": reference_name,
+        }
 
     def make_outprefix(it: int, k: int) -> str:
         d = os.path.join(work_dir, f"iter{it:02d}_img{k:04d}")

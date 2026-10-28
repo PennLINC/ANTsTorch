@@ -282,10 +282,14 @@ def test_build_template_initial_alignment_starts_from_aligned_inputs(tmp_path):
         affine_multi_start=False, device="cpu", blending_weight=1.0,
     )
     res = build_template(
-        image_list=images, extra_contrasts=[extras], iterations=1, output_dir=str(tmp_path / "aligned"), initial_alignment="Rigid", **common
+        image_list=images, extra_contrasts=[extras], iterations=1, output_dir=str(tmp_path / "aligned"), initial_alignment="Rigid",
+        initial_alignment_iterations=2, **common,
     )
     pre = res["initial_alignment"]
-    assert pre is not None and pre["n_iterations"] == 1 and res["n_iterations"] == 1
+    assert pre is not None and pre["reference"] == "image 0" and res["n_iterations"] == 1
+    # Pass 1 targets image 0, pass 2 the running average.
+    assert [r["n_iterations"] for r in pre["passes"]] == [1, 1]
+    assert os.path.isfile(os.path.join(tmp_path, "aligned", "initial_rigid_reference", "iter00_img0000", "out0GenericAffine.mat"))
     assert os.path.isfile(os.path.join(tmp_path, "aligned", "initial_rigid", "iter00_img0000", "out0GenericAffine.mat"))
     assert np.isfinite(res["template"].numpy()).all() and np.isfinite(res["extra_templates"][0].numpy()).all()
     # Rigidly aligning the blobs before averaging gives a sharper starting template than the plain average.
@@ -299,3 +303,40 @@ def test_build_template_initial_alignment_starts_from_aligned_inputs(tmp_path):
     assert again["initial_alignment"] is None
     with pytest.raises(ValueError, match="initial_alignment must be one of"):
         build_template(image_list=images, iterations=1, output_dir=str(tmp_path / "bad"), initial_alignment="SyN", **common)
+    with pytest.raises(ValueError, match="not an index into image_list"):
+        build_template(
+            image_list=images, iterations=1, output_dir=str(tmp_path / "bad2"), initial_alignment="Rigid", initial_alignment_reference=3, **common
+        )
+    with pytest.raises(ValueError, match="must be a sequence"):
+        build_template(
+            image_list=images, extra_contrasts=[extras], iterations=1, output_dir=str(tmp_path / "bad3"), initial_alignment="Rigid",
+            initial_alignment_reference=images[1], **common,
+        )
+
+
+def test_initial_alignment_reference_image_breaks_ghosts_in_the_average(tmp_path):
+    # Two subsets of inputs that already share a pose, 8 voxels apart: the plain average shows two ghosts, and a first
+    # pass against that average leaves the inputs split between them; a first pass against one input gathers everything.
+    def blob(center, shape=(16, 12, 12), sigma=1.5):
+        grid = np.indices(shape, dtype=np.float32)
+        return ants.from_numpy(np.ascontiguousarray(np.exp(-sum((g - c) ** 2 for g, c in zip(grid, center)) / (2.0 * sigma ** 2))))
+
+    images = [blob(c) for c in ((4, 6, 6), (4, 6, 6), (12, 6, 6), (12, 6, 6))]
+    common = dict(
+        type_of_transform="Translation", initial_alignment="Translation", affine_iterations=(40, 40, 40), affine_multi_start=False,
+        device="cpu", iterations=1, blending_weight=1.0,
+    )
+    gathered = build_template(image_list=images, output_dir=str(tmp_path / "ref"), initial_alignment_reference=0, **common)
+    # Against the ghosted average each input starts where it is, already on top of its own ghost, and stays there
+    # (the center-of-mass start would first drop every input onto the saddle between the ghosts, where identical
+    # blobs then fall either way; real brains fall by their own shape, and the subsets still split).
+    ghosted = build_template(
+        image_list=images, output_dir=str(tmp_path / "avg"), initial_alignment_reference=None, affine_center_of_mass_init=False, **common
+    )
+    assert gathered["initial_alignment"]["reference"] == "image 0"
+    assert ghosted["initial_alignment"]["reference"] == "the average of the unaligned inputs"
+    assert gathered["initial_alignment"]["template"].numpy().max() > 0.85
+    assert ghosted["initial_alignment"]["template"].numpy().max() < 0.7
+    # The gathered template sits at the group's mean pose (between the two subsets), not on the reference input.
+    peak = np.unravel_index(gathered["initial_alignment"]["template"].numpy().argmax(), (16, 12, 12))
+    assert 6 <= peak[0] <= 10

@@ -34,6 +34,8 @@ def main():
     parser.add_argument("--initial-alignment", default=None, choices=("Translation", "Rigid", "Similarity", "Affine"),
                         help="linear pre-alignment of the inputs before the main loop (ANTs -r 1 is Rigid)")
     parser.add_argument("--initial-alignment-iterations", type=int, default=1)
+    parser.add_argument("--initial-alignment-reference", type=int, default=0,
+                        help="input index the first pre-alignment pass targets (-1: the plain average)")
     parser.add_argument("--extra-weights", type=float, nargs="+", default=None,
                         help="weight of each extra contrast in the similarity (default 1)")
     args = parser.parse_args()
@@ -54,6 +56,7 @@ def main():
         flow_sigma=args.flow_sigma, total_sigma=args.total_sigma, output_interpolator=args.output_interpolator,
         extra_contrasts=extras or None, extra_contrast_weights=args.extra_weights,
         initial_alignment=args.initial_alignment, initial_alignment_iterations=args.initial_alignment_iterations,
+        initial_alignment_reference=None if args.initial_alignment_reference < 0 else args.initial_alignment_reference,
         device=args.device, verbose=True,
     )
     fod_image_write(result["template"], str(args.output_dir / "template.nii.gz"))
