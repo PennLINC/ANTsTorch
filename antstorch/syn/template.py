@@ -46,6 +46,7 @@ from .bridge import (
 )
 from .core.grid import get_physical_grid_torch, grid_sample_nd, physical_to_normalized_torch_cached
 from .fod import FODRegistration, direction_transform, pullback_jacobian, sh_lmax_of_image
+from .syn import _resolve_device
 
 __all__ = ["build_template"]
 
@@ -536,9 +537,7 @@ def build_template(
     n = len(image_list)
     weights = _normalize_weights(weights, n)
     interpolator = _resolve_interpolator(kwargs, bool(kwargs.get("fod", False)))
-    torch_device = kwargs.get("device")
-    if torch_device is None:
-        torch_device = "cuda" if torch.cuda.is_available() else "cpu"
+    torch_device = _resolve_device(kwargs.get("device"))
 
     # FOD (spherical harmonic) inputs: the registrations handle the reorientation
     # (``fod=True`` is forwarded to syn_registration); the template-side steps

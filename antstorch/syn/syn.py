@@ -512,6 +512,31 @@ def _sample_output(image: Tensor, coords: Tensor, interpolator: str, padding_mod
     return grid_sample_nd(image, coords, interpolator=interpolator, padding_mode=padding_mode, align_corners=True)
 
 
+def _resolve_device(device) -> torch.device:
+    """The device a call runs on: ``device``, else ``antstorch.set_default_device()``, else auto-detection."""
+    if device is None:
+        # Respect an explicit antstorch.set_default_device(); otherwise fall through to auto-detection below.
+        from ..utilities.device_manager import get_user_default_device
+        device = get_user_default_device()
+    if device is None:
+        auto_device = auto_detect_device(requested_device=None)
+        if auto_device == "mps":
+            # bspline_flows.affine_registration()'s differentiable warp
+            # (used by every type_of_transform except 'SyNOnly' with no
+            # internal affine fit) backpropagates through F.grid_sample,
+            # whose backward pass is not implemented on MPS as of the
+            # PyTorch versions this has been tested against
+            # (NotImplementedError: aten::grid_sampler_2d_backward /
+            # grid_sampler_3d_backward). Auto-detection therefore skips mps
+            # and falls back to cpu; pass device='mps' explicitly to opt in
+            # anyway (e.g. once PyTorch adds the missing op, or for
+            # type_of_transform='SyNOnly' calls that never differentiate
+            # through the affine warp).
+            auto_device = "cpu"
+        return torch.device(auto_device)
+    return torch.device(device)
+
+
 def _fit_syn_level(
     I_curr: Tensor,
     J_curr: Tensor,
@@ -1430,28 +1455,7 @@ def syn_registration(
         raise ValueError("levels and reg_iterations must have the same length")
 
     dimension = fixed.dimension
-    if device is None:
-        # Respect an explicit antstorch.set_default_device(); otherwise fall through to auto-detection below.
-        from ..utilities.device_manager import get_user_default_device
-        device = get_user_default_device()
-    if device is None:
-        auto_device = auto_detect_device(requested_device=None)
-        if auto_device == "mps":
-            # bspline_flows.affine_registration()'s differentiable warp
-            # (used by every type_of_transform except 'SyNOnly' with no
-            # internal affine fit) backpropagates through F.grid_sample,
-            # whose backward pass is not implemented on MPS as of the
-            # PyTorch versions this has been tested against
-            # (NotImplementedError: aten::grid_sampler_2d_backward /
-            # grid_sampler_3d_backward). Auto-detection therefore skips mps
-            # and falls back to cpu; pass device='mps' explicitly to opt in
-            # anyway (e.g. once PyTorch adds the missing op, or for
-            # type_of_transform='SyNOnly' calls that never differentiate
-            # through the affine warp).
-            auto_device = "cpu"
-        resolved_device = torch.device(auto_device)
-    else:
-        resolved_device = torch.device(device)
+    resolved_device = _resolve_device(device)
     # Whether this call will run _fit_affine_from_ants() -> bspline_flows.
     # affine_registration() -- the one grid_sample-needing-backward code
     # path in this function that is NOT (as of this writing) routed through
@@ -1468,7 +1472,7 @@ def syn_registration(
             # mps_grid_sample_3d_available() probes forward AND backward: PyTorch
             # PR #160541 (merged 2025-08-15, shipped starting with the 2.9.0
             # stable release) added a native MPS kernel for grid_sampler_3d
-            # *forward*, closing the crash the backward-pass skip above doesn't
+            # *forward*, closing the crash the backward-pass skip in _resolve_device doesn't
             # touch (e.g. 'SyNOnly' / no-grad calls) -- but no MPS kernel for
             # grid_sampler_3d_backward has been found as of this writing (see
             # https://github.com/pytorch/pytorch/issues/160237). The internal
