@@ -27,6 +27,8 @@ spacing, origin and direction when converting images. The
 
 SyN returns paths compatible with `ants.apply_transforms`. B-spline SVF
 registration returns tensors, with any initial affine returned separately.
+With extra contrasts, SyN's internal affine fit uses every contrast as a channel
+(`affine_extra_contrasts`, default on), as the ANTs multivariate template script does.
 Use label interpolation when resampling segmentations. See the
 [SyN guide](antsx_tutorial_syn.md) for file ordering and inverse transforms.
 

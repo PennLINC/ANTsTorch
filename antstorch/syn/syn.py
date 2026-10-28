@@ -868,8 +868,13 @@ def _fit_affine_from_ants(
     multi_start: bool,
     center_of_mass_init: bool,
     verbose: bool,
+    extra_channels=None,
 ):
-    """Fit the affine initialization with :func:`antstorch.bspline_flows.affine_registration.affine_registration`."""
+    """Fit the affine initialization with :func:`antstorch.bspline_flows.affine_registration.affine_registration`.
+
+    ``extra_channels``, if given, is a ``(fixed, moving)`` pair of ``(1, n_extra, *spatial)`` tensors
+    (the extra contrasts, already normalized and weighted) appended to the images as further channels.
+    """
     # Imported lazily (not at module scope): antstorch.bspline_flows itself
     # imports antstorch.syn.core (for HierarchicalAffine), so an eager
     # module-level import here would create a circular import whenever
@@ -885,6 +890,9 @@ def _fit_affine_from_ants(
     moving_domain = ImageDomain(moving_meta["shape"], moving_meta["spacing"], moving_meta["origin"], moving_meta["direction"])
     fixed_tensor = ants_image_to_tensor(fixed, device, dtype)
     moving_tensor = ants_image_to_tensor(moving, device, dtype)
+    if extra_channels is not None:
+        fixed_tensor = torch.cat([fixed_tensor, extra_channels[0]], dim=1)
+        moving_tensor = torch.cat([moving_tensor, extra_channels[1]], dim=1)
     result = _bspline_affine_registration(
         fixed_tensor,
         moving_tensor,
@@ -984,6 +992,7 @@ def syn_registration(
     affine_learning_rate: Union[float, Sequence[float]] = (0.05, 0.03, 0.02),
     affine_multi_start: bool = True,
     affine_center_of_mass_init: bool = True,
+    affine_extra_contrasts: bool = True,
     syn_metric: Optional[str] = None,
     neighborhood_radius: int = 2,
     num_bins: int = 32,
@@ -1296,8 +1305,14 @@ def syn_registration(
     truncated SH series and is never reoriented. ``extra_contrast_weights``
     (one per contrast, default 1) scale a contrast's contribution to the
     similarity: its window moments for ``'lncc_joint'``, its squared
-    differences for ``'mse'``. The affine stage uses the primary images
-    alone. The warped extra images come back as ``warpedmovout_extras`` and
+    differences for ``'mse'``. With ``affine_extra_contrasts`` (default
+    ``True``) the extra contrasts also join the affine fit as further channels
+    (each image percentile-normalized on its own, weighted like the dense
+    stage), the way ``antsMultivariateTemplateConstruction2`` gives every
+    modality a metric in its affine stage; on the FOD ``l = 0`` channel alone
+    the affine misjudges global scale against a blurry template (6 to 8 % in
+    volume on 1.25 mm data), which a T1w channel removes. The warped extra
+    images come back as ``warpedmovout_extras`` and
     ``warpedfixout_extras`` (lists in the order given, on the fixed grid).
 
     Returns
@@ -1534,6 +1549,13 @@ def syn_registration(
         affine_moving = fod_registration.scalar_channel(moving)
 
     # --- Affine stage -----------------------------------------------------
+    # The extra contrasts join the affine fit as further channels (per-image normalized, weighted as in
+    # the dense stage), as antsMultivariateTemplateConstruction2 gives every modality a metric in its
+    # affine stage. On the FOD l = 0 channel alone the affine misjudges global scale against a blurry
+    # template (6 to 8 % in volume on 1.25 mm CRASH data, under every similarity); a T1w channel removes it.
+    affine_extra = None
+    if affine_extra_contrasts and extra_pairs and initial_affine is None:
+        affine_extra = _extra_contrast_tensors(extra_pairs, extra_weights, False, resolved_device, dtype)
     affine_result = None
     if initial_affine is not None:
         matrix_xyz, translation_xyz = initial_affine
@@ -1556,6 +1578,7 @@ def syn_registration(
             multi_start=affine_multi_start,
             center_of_mass_init=affine_center_of_mass_init,
             verbose=verbose,
+            extra_channels=affine_extra,
         )
     else:  # SyNOnly, no initial_affine supplied: identity.
         matrix_xyz = torch.eye(dimension, device=resolved_device, dtype=dtype)
